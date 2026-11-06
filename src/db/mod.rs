@@ -14,7 +14,6 @@ pub mod writer;
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use rusqlite::Connection;
@@ -132,7 +131,7 @@ pub fn spawn_writer(cfg: &DatabaseConfig) -> Result<DbHandle, DbError> {
     // Bounded on purpose: a full queue drops records (and counts them) rather
     // than applying backpressure to a network task.
     let (tx, rx) = mpsc::channel(cfg.queue_capacity.max(1));
-    let dropped = Arc::new(AtomicU64::new(0));
+    let dropped = Arc::new(crate::record::DropCounter::new(0));
     let recorder = Recorder::new(tx, dropped);
 
     let tuning = writer::Tuning::from_config(cfg);
@@ -145,7 +144,7 @@ pub fn spawn_writer(cfg: &DatabaseConfig) -> Result<DbHandle, DbError> {
 pub(crate) mod testutil {
     use std::net::IpAddr;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant, SystemTime};
 
     use rusqlite::Connection;
@@ -161,7 +160,7 @@ pub(crate) mod testutil {
     /// Fixed AUTH delay used by the fixtures, so assertions can name it.
     pub(crate) const TEST_DELAY_MS: u64 = 3_821;
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     /// A database path that exists only for one test.
     ///

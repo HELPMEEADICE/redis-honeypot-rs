@@ -7,7 +7,18 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
+
+/// Counter for records dropped because the bounded queue was full.
+///
+/// `AtomicU64` does not exist on targets without 64-bit atomics (for example
+/// `mips-unknown-linux-gnu`), so the counter is machine-word sized and widened
+/// to `u64` at the API boundary. Wrapping at 2^32 on such a target is
+/// acceptable for a diagnostic counter.
+#[cfg(target_has_atomic = "64")]
+pub type DropCounter = std::sync::atomic::AtomicU64;
+#[cfg(not(target_has_atomic = "64"))]
+pub type DropCounter = std::sync::atomic::AtomicUsize;
 use std::time::SystemTime;
 
 use tokio::sync::mpsc;
@@ -173,11 +184,11 @@ pub enum Record {
 #[derive(Debug, Clone, Default)]
 pub struct Recorder {
     tx: Option<mpsc::Sender<Record>>,
-    dropped: Option<Arc<AtomicU64>>,
+    dropped: Option<Arc<DropCounter>>,
 }
 
 impl Recorder {
-    pub fn new(tx: mpsc::Sender<Record>, dropped: Arc<AtomicU64>) -> Self {
+    pub fn new(tx: mpsc::Sender<Record>, dropped: Arc<DropCounter>) -> Self {
         Self {
             tx: Some(tx),
             dropped: Some(dropped),
@@ -212,7 +223,13 @@ impl Recorder {
     pub fn dropped(&self) -> u64 {
         self.dropped
             .as_ref()
-            .map(|c| c.load(Ordering::Relaxed))
+            .map(|counter| {
+                // A no-op where `DropCounter` is already 64-bit, and required
+                // where it is not (targets without 64-bit atomics).
+                #[allow(clippy::unnecessary_cast)]
+                let value = counter.load(Ordering::Relaxed) as u64;
+                value
+            })
             .unwrap_or(0)
     }
 }
@@ -238,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn full_queue_drops_and_counts_instead_of_blocking() {
         let (tx, mut rx) = mpsc::channel(1);
-        let dropped = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(DropCounter::new(0));
         let recorder = Recorder::new(tx, dropped.clone());
 
         let mk = || {

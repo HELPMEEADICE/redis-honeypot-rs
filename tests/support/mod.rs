@@ -9,7 +9,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,7 +20,7 @@ use redis_honeypot_rs::config::Config;
 use redis_honeypot_rs::db::{self, DbHandle};
 use redis_honeypot_rs::server::{self, ServerError, ServerSummary, ShutdownHandle};
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
+static SEQ: AtomicUsize = AtomicUsize::new(0);
 
 /// A unique temp database path per test, cleaned up in [`Harness::stop`].
 pub fn temp_db_path() -> PathBuf {

@@ -433,7 +433,6 @@ fn size_i64(value: usize) -> i64 {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
     use std::time::SystemTime;
 
     use super::*;
@@ -587,7 +586,7 @@ mod tests {
     async fn queue_saturation_is_counted_not_fatal() {
         // A channel nobody drains: capacity 1 means the 2nd and 3rd emit fail.
         let (tx, mut rx) = mpsc::channel(1);
-        let recorder = Recorder::new(tx, Arc::new(AtomicU64::new(0)));
+        let recorder = Recorder::new(tx, Arc::new(crate::record::DropCounter::new(0)));
         let at = now();
         assert!(recorder.emit(command(1, "198.51.100.23", at, "PING", "", RiskLevel::None)));
         assert!(!recorder.emit(command(1, "198.51.100.23", at, "PING", "", RiskLevel::None)));

@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -278,7 +278,8 @@ pub async fn serve(
     let shared = Arc::new(SharedState::new(config.clone(), recorder.clone()));
     let permits = Arc::new(Semaphore::new(limits.max_connections.max(1)));
     let ip_counters: IpCounters = Arc::new(Mutex::new(HashMap::new()));
-    let next_conn_id = AtomicU64::new(1);
+    // Machine-word sized so 32-bit targets without 64-bit atomics still compile.
+    let next_conn_id = AtomicUsize::new(1);
     let mut tasks: JoinSet<()> = JoinSet::new();
     let mut summary = ServerSummary::default();
     let mut shutdown_rx = shutdown.subscribe();
@@ -356,7 +357,7 @@ pub async fn serve(
 
         // ------------------------------------------------------------ spawn
         summary.accepted += 1;
-        let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
+        let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed) as u64;
         if let Err(err) = stream.set_nodelay(true) {
             // Not fatal: only latency simulation quality suffers.
             logging::warn(&format!("cannot set TCP_NODELAY for {peer}: {err}"));
@@ -607,7 +608,7 @@ mod tests {
     #[tokio::test]
     async fn auth_is_answered_after_the_configured_delay() {
         let (tx, mut rx) = mpsc::channel(64);
-        let recorder = Recorder::new(tx, Arc::new(AtomicU64::new(0)));
+        let recorder = Recorder::new(tx, Arc::new(crate::record::DropCounter::new(0)));
         // base_config: auth window 10..=20 ms.
         let server = start(base_config(), recorder).await;
         let mut client = server.connect().await;
@@ -746,7 +747,7 @@ mod tests {
     #[tokio::test]
     async fn partial_frame_is_reaped_as_stuck_client() {
         let (tx, mut rx) = mpsc::channel(64);
-        let recorder = Recorder::new(tx, Arc::new(AtomicU64::new(0)));
+        let recorder = Recorder::new(tx, Arc::new(crate::record::DropCounter::new(0)));
         let config = config_with(|cfg| cfg.limits.partial_frame_timeout_secs = 1);
         let server = start(config, recorder).await;
         let mut client = server.connect().await;

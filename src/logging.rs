@@ -13,7 +13,7 @@
 //! readable side channel.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tracing_subscriber::EnvFilter;
 
@@ -25,9 +25,9 @@ const MAX_LINES_PER_SEC: u64 = 200;
 /// Hard cap on one console line body (before the `[time] KIND ` prefix).
 const MAX_BODY_LEN: usize = 512;
 
-static WINDOW_SEC: AtomicU64 = AtomicU64::new(0);
-static WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
-static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+static WINDOW_SEC: AtomicUsize = AtomicUsize::new(0);
+static WINDOW_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SUPPRESSED: AtomicUsize = AtomicUsize::new(0);
 
 /// Install the global tracer. Safe to call twice (second call is ignored).
 pub fn init(level: &str) {
@@ -69,7 +69,7 @@ fn scrub(body: &str) -> String {
 
 /// Rate gate. Returns `true` when this line may be printed.
 fn admit() -> bool {
-    let now = timeutil::unix_secs(timeutil::now()).max(0) as u64;
+    let now = timeutil::unix_secs(timeutil::now()).max(0) as usize;
     let seen = WINDOW_SEC.load(Ordering::Relaxed);
     if seen != now
         && WINDOW_SEC
@@ -84,7 +84,7 @@ fn admit() -> bool {
     }
 
     let count = WINDOW_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if count > MAX_LINES_PER_SEC {
+    if count as u64 > MAX_LINES_PER_SEC {
         SUPPRESSED.fetch_add(1, Ordering::Relaxed);
         false
     } else {
