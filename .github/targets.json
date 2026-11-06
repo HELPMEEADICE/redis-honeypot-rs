@@ -80,7 +80,7 @@
     "extra_args": "",
     "ext": "",
     "apt": "",
-    "timeout": 30,
+    "timeout": 60,
     "rustflags": ""
   },
   {
@@ -94,7 +94,7 @@
     "extra_args": "",
     "ext": "",
     "apt": "",
-    "timeout": 30,
+    "timeout": 60,
     "rustflags": ""
   },
   {
