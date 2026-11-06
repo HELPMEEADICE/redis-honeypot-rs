@@ -1,0 +1,53 @@
+# redis-honeypot-rs — 示例配置
+#
+# 用法：
+#   redis-honeypot-rs serve --config ./config.example.toml
+#
+# 规则：文件里没写的字段沿用内置默认值；命令行参数会覆盖文件里的同名项。
+# 启动时会做校验，越界或自相矛盾的配置直接拒绝启动（退出码 2）。
+
+# 监听地址。默认 0.0.0.0:6379。调试时可以写 127.0.0.1:16379。
+bind = "0.0.0.0:6379"
+
+# 额外监听 [::]:<同一端口>，用于 IPv6 扫描器。绑定失败只告警，不影响 IPv4。
+enable_ipv6 = false
+
+# 是否把攻击者提交的密码明文写入 auth_attempts.password。
+# 默认 false，只记录用户名、参数个数和密码长度。需要字典取证时再打开。
+record_passwords = false
+
+[timing]
+# AUTH 的随机延迟窗口（毫秒）。默认 2000–6000，即 2–6 秒。
+# 低于 2 秒会削弱反自动化效果，启动时会打印告警。
+auth_min_delay_ms = 2000
+auth_max_delay_ms = 6000
+# 普通命令的额外抖动上限（毫秒）。0 = 立即响应。
+command_jitter_max_ms = 0
+
+[limits]
+max_connections = 512
+max_connections_per_ip = 16
+max_message_bytes = 524288
+max_bulk_len = 524288
+max_array_len = 1024
+max_depth = 8
+max_args = 256
+max_commands_per_conn = 1024
+max_auth_attempts = 64
+idle_timeout_secs = 1800
+partial_frame_timeout_secs = 30
+max_stored_param_bytes = 2048
+store_max_keys = 1024
+store_max_bytes = 1048576
+store_max_value_bytes = 4096
+store_max_ttl_secs = 86400
+
+[database]
+path = "./redis-honeypot.db"
+max_bytes = 268435456
+queue_capacity = 8192
+batch_size = 128
+batch_interval_ms = 250
+retention_days = 30
+checkpoint_interval_secs = 300
+maintenance_interval_secs = 60

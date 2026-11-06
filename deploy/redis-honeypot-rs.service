@@ -1,0 +1,75 @@
+[Unit]
+Description=Redis honeypot (redis-honeypot-rs)
+Documentation=file:/usr/share/doc/redis-honeypot-rs/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=redishoney
+Group=redishoney
+
+# --- process ---------------------------------------------------------------
+WorkingDirectory=/var/lib/redis-honeypot
+StateDirectory=redis-honeypot
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/redis-honeypot-rs serve \
+    --bind 0.0.0.0:6379 \
+    --db /var/lib/redis-honeypot/redis-honeypot.db
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2s
+TimeoutStopSec=20s
+KillSignal=SIGTERM
+
+# --- filesystem sandbox ----------------------------------------------------
+# The honeypot must never read or write anything except its own database.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/var/lib/redis-honeypot
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictFileSystems=@basic-api
+UMask=0077
+
+# --- kernel / syscall sandbox ---------------------------------------------
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @mount @swap @cpu-emulation
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# --- resource caps (the honeypot is deliberately tiny) --------------------
+LimitNOFILE=8192
+LimitCORE=0
+MemoryMax=256M
+MemoryHigh=192M
+CPUQuota=50%
+TasksMax=256
+IOWeight=50
+OOMScoreAdjust=200
+
+# --- logging --------------------------------------------------------------
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=redis-honeypot
+
+[Install]
+WantedBy=multi-user.target

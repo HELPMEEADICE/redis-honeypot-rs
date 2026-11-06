@@ -1,0 +1,17 @@
+# Normalise line endings in the repository and in every working tree.
+# Rationale: a CRLF checkout of deploy/redis-honeypot-rs.service breaks
+# systemd unit parsing on Linux, and mixed EOLs make diffs noisy.
+* text=auto eol=lf
+
+*.rs        text eol=lf
+*.toml      text eol=lf
+*.md        text eol=lf
+*.service   text eol=lf
+LICENSE     text eol=lf
+.gitignore  text eol=lf
+
+# Build products, if ever added by accident.
+*.exe       binary
+*.db        binary
+*.db-wal    binary
+*.db-shm    binary
