@@ -1,0 +1,112 @@
+name: CI
+
+# Fast feedback only: formatting, lints, and the full test suite on every OS.
+# Cross-compiled release artifacts live in build.yml.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch cancels the older, still-running check.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+      - name: cargo clippy -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One red platform must not hide the others.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.os }}
+      # The suite is self-contained: real TCP listeners on 127.0.0.1:0,
+      # temporary SQLite files, no network access, no external Redis.
+      - name: cargo test --all-targets
+        run: cargo test --all-targets --locked
+
+  release-artifact:
+    name: release build + smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - name: report binary size
+        run: |
+          set -euo pipefail
+          ls -l target/release/redis-honeypot-rs
+          du -h target/release/redis-honeypot-rs
+
+      # Prove the optimised binary really speaks RESP over a socket, not just
+      # that it links. `$4` is escaped so bash hands printf a literal `$4`.
+      - name: smoke test the release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/redis-honeypot-rs serve \
+            --bind 127.0.0.1:16379 \
+            --db "$RUNNER_TEMP/smoke.db" \
+            --min-delay 50 --max-delay 80 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 40); do
+            reply=$(timeout 2 bash -c \
+              'exec 3<>/dev/tcp/127.0.0.1/16379; printf "*1\r\n\$4\r\nPING\r\n" >&3; head -c 7 <&3' \
+              2>/dev/null || true)
+            if [[ "$reply" == *PONG* ]]; then
+              echo "PING ok, raw reply: [$reply]"
+              exit 0
+            fi
+            sleep 0.25
+          done
+
+          echo "the release binary never answered PING" >&2
+          exit 1

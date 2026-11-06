@@ -225,6 +225,40 @@ cargo build --release
 测试全部是本地闭环的：不访问公网、不加载动态模块、不修改主机 Redis 配置、
 不依赖真实 Redis 服务端；集成测试在 `127.0.0.1:0` 上起真服务，用裸 TCP 说协议。
 
+### 9.1 GitHub Actions
+
+| 工作流 | 触发 | 内容 |
+| --- | --- | --- |
+| `.github/workflows/ci.yml` | push 到 `main`、PR、手动 | `rustfmt --check`、`cargo clippy -D warnings`、三平台（Linux/Windows/macOS）`cargo test --all-targets`、release 构建 + 裸 TCP `PING` 冒烟 |
+| `.github/workflows/build.yml` | Release published、手动 | 9 个目标交叉编译，产物打包成 archive 并作为可下载 artifact；Release 触发时自动上传到该 Release，并附 `SHA256SUMS.txt` |
+
+构建矩阵（全部使用 `Cargo.toml` 里的体积优先 profile）：
+
+| 矩阵名 | target triple | runner | 构建方式 |
+| --- | --- | --- | --- |
+| `linux-x86_64` | `x86_64-unknown-linux-gnu` | ubuntu-latest | 原生 cargo |
+| `linux-aarch64` | `aarch64-unknown-linux-gnu` | ubuntu-latest | `cross`（Docker 工具链） |
+| `linux-armv7` | `armv7-unknown-linux-gnueabihf` | ubuntu-latest | `cross` |
+| `linux-riscv64` | `riscv64gc-unknown-linux-gnu` | ubuntu-latest | `cross` |
+| `linux-mips` | `mips-unknown-linux-gnu` | ubuntu-latest | nightly + `-Z build-std=std,panic_abort` + `gcc-mips-linux-gnu` |
+| `macos-x86_64` | `x86_64-apple-darwin` | macos-latest | 原生 cargo（arm64 主机交叉到 x86_64） |
+| `macos-aarch64` | `aarch64-apple-darwin` | macos-latest | 原生 cargo |
+| `windows-x86_64` | `x86_64-pc-windows-msvc` | windows-latest | 原生 cargo |
+| `windows-aarch64` | `aarch64-pc-windows-msvc` | windows-latest | 原生 cargo + ARM64 MSVC 工具链 |
+
+`linux-mips` 单独处理的原因：`mips-unknown-linux-gnu` 是 tier 3 目标，官方不发布预编译 `std`，
+必须 nightly + `-Z build-std`；同时 rusqlite 的 `bundled` 会编译 SQLite 的 C 代码，所以还需要真正的
+mips GCC 交叉编译器（`gcc-mips-linux-gnu`）与 `CC_mips_unknown_linux_gnu`/链接器环境变量。
+
+手动触发时可以只构建部分目标，便于排查单个平台：
+
+```bash
+gh workflow run build.yml --repo HELPMEEADICE/redis-honeypot-rs -f only=linux-mips,windows-aarch64
+```
+
+产物命名：`redis-honeypot-rs-<version>-<target>.tar.gz`（Windows 为 `.zip`），
+Linux 的包内额外带 `deploy/` 下的 systemd unit 与示例配置。
+
 ---
 
 ## 10. 实测数据
@@ -233,13 +267,19 @@ cargo build --release
 
 ### 10.1 构建产物体积
 
-| profile | 参数 | 体积 |
+当前 `Cargo.toml` 的 profile 按"优化开满"配置：`opt-level="z"` `lto="fat"` `codegen-units=1`
+`panic="abort"` `strip="debuginfo"` `debug=false` `incremental=false` `overflow-checks=false`。
+
+| profile | 参数差异 | 体积 |
 | --- | --- | --- |
-| **release（默认）** | `opt-level="z"` `lto="fat"` `codegen-units=1` `panic="abort"` `strip="symbols"` | **2,267,136 B = 2.16 MiB** |
-| 对比：吞吐优先 | `opt-level=3` `lto="thin"` `codegen-units=16`（同样 strip + panic=abort） | 2,982,912 B = 2.84 MiB（**+31.6%**） |
+| **release（当前）** | `strip="debuginfo"`（保留符号表） | **3,517,691 B = 3.35 MiB** |
+| 对比：去掉符号表 | 同配置但 `strip="symbols"` | 2,265,088 B = 2.16 MiB（**−35.6%**） |
+| 对比：吞吐优先 | `opt-level=3` `lto="thin"` `codegen-units=16` `strip="symbols"` | 2,982,912 B = 2.84 MiB |
 | 对比：debug | 默认 dev profile | 71,763,480 B = 68.44 MiB |
 
-SQLite 用 `bundled` 编进二进制（C amalgamation），所以这 2.16 MiB 里包含了完整的 SQLite，运行时**没有任何动态依赖**。
+`strip="debuginfo"` 只删调试信息、保留符号表，所以比 `strip="symbols"` 大 1.19 MiB——
+换来的是崩溃栈里能直接看到函数名。要最小体积就把它改成 `strip="symbols"`。
+SQLite 用 `bundled` 编进二进制（C amalgamation），所以这些数字里已包含完整 SQLite，运行时**没有任何动态依赖**。
 release 全量构建约 14–40 秒（纯增量 14 s，含依赖 40 s）。
 
 ### 10.2 运行时内存与线程

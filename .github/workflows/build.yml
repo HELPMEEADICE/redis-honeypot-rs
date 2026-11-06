@@ -1,0 +1,335 @@
+name: Build
+
+# Cross-compiled release binaries for nine targets.
+#
+#   * release published  -> build, then attach every archive to that release
+#   * workflow_dispatch  -> build, archives downloadable from the run page
+#
+# The size profile lives in Cargo.toml ([profile.release]); Actions cannot
+# override a profile per job, so the manifest is the single source of truth:
+#   opt-level="z" lto="fat" codegen-units=1 panic="abort"
+#   strip="debuginfo" debug=false incremental=false overflow-checks=false
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version-override:
+        description: "Override the version string used in archive names (default: crate version)"
+        required: false
+        default: ""
+      only:
+        description: "Build a subset by matrix name, comma separated, no spaces (e.g. linux-mips,macos-aarch64)"
+        required: false
+        default: ""
+
+# Never cancel a release build half-way; a manual run for the same ref does not
+# need to queue behind an older one of itself.
+concurrency:
+  group: build-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: redis-honeypot-rs
+
+jobs:
+  setup:
+    name: resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: resolve
+        shell: bash
+        env:
+          OVERRIDE: ${{ inputs.version-override }}
+        run: |
+          set -euo pipefail
+          version="${OVERRIDE:-}"
+          if [ -z "$version" ]; then
+            version=$(cargo metadata --no-deps --format-version 1 --locked \
+              | jq -r '.packages[] | select(.name == "redis-honeypot-rs") | .version')
+          fi
+          [ -n "$version" ] || { echo "could not resolve the crate version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "building version $version"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: setup
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    # `only` lets a single target be rebuilt without paying for all nine.
+    if: |
+      inputs.only == '' ||
+      contains(format(',{0},', inputs.only), format(',{0},', matrix.name))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- linux -------------------------------------------------------
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            builder: cargo
+            toolchain: stable
+            install_target: x86_64-unknown-linux-gnu
+            components: ""
+            extra_args: ""
+            ext: ""
+            apt: ""
+            timeout: 30
+
+          - name: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            builder: cross
+            toolchain: stable
+            install_target: aarch64-unknown-linux-gnu
+            components: ""
+            extra_args: ""
+            ext: ""
+            apt: ""
+            timeout: 40
+
+          - name: linux-armv7
+            os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            builder: cross
+            toolchain: stable
+            install_target: armv7-unknown-linux-gnueabihf
+            components: ""
+            extra_args: ""
+            ext: ""
+            apt: ""
+            timeout: 40
+
+          - name: linux-riscv64
+            os: ubuntu-latest
+            target: riscv64gc-unknown-linux-gnu
+            builder: cross
+            toolchain: stable
+            install_target: riscv64gc-unknown-linux-gnu
+            components: ""
+            extra_args: ""
+            ext: ""
+            apt: ""
+            timeout: 40
+
+          # Tier 3: no prebuilt std, so nightly + -Z build-std and a real
+          # cross C toolchain for the bundled SQLite (rusqlite "bundled").
+          - name: linux-mips
+            os: ubuntu-latest
+            target: mips-unknown-linux-gnu
+            builder: cargo-build-std
+            toolchain: nightly
+            install_target: ""
+            components: rust-src
+            extra_args: "-Z build-std=std,panic_abort"
+            ext: ""
+            apt: gcc-mips-linux-gnu
+            timeout: 60
+
+          # ---- macos -------------------------------------------------------
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            builder: cargo
+            toolchain: stable
+            install_target: x86_64-apple-darwin
+            components: ""
+            extra_args: ""
+            ext: ""
+            apt: ""
+            timeout: 30
+
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            builder: cargo
+            toolchain: stable
+            install_target: aarch64-apple-darwin
+            components: ""
+            extra_args: ""
+            ext: ""
+            apt: ""
+            timeout: 30
+
+          # ---- windows -----------------------------------------------------
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            builder: cargo
+            toolchain: stable
+            install_target: x86_64-pc-windows-msvc
+            components: ""
+            extra_args: ""
+            ext: ".exe"
+            apt: ""
+            timeout: 30
+
+          - name: windows-aarch64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            builder: cargo
+            toolchain: stable
+            install_target: aarch64-pc-windows-msvc
+            components: ""
+            extra_args: ""
+            ext: ".exe"
+            apt: ""
+            timeout: 30
+
+    env:
+      TARGET: ${{ matrix.target }}
+      EXT: ${{ matrix.ext }}
+      VERSION: ${{ needs.setup.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain (target has prebuilt std)
+        if: matrix.install_target != ''
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          targets: ${{ matrix.install_target }}
+          components: ${{ matrix.components }}
+
+      - name: Toolchain (build-std, no prebuilt target)
+        if: matrix.install_target == ''
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rust-src
+
+      - name: Cross C toolchain for the bundled SQLite
+        if: matrix.apt != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "${{ matrix.apt }}"
+
+      - name: mips linker environment
+        if: matrix.name == 'linux-mips'
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "CARGO_TARGET_MIPS_UNKNOWN_LINUX_GNU_LINKER=mips-linux-gnu-gcc"
+            echo "CC_mips_unknown_linux_gnu=mips-linux-gnu-gcc"
+            echo "AR_mips_unknown_linux_gnu=mips-linux-gnu-ar"
+          } >> "$GITHUB_ENV"
+
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        env:
+          BUILDER: ${{ matrix.builder }}
+          EXTRA: ${{ matrix.extra_args }}
+        run: |
+          set -euo pipefail
+          args=(build --release --locked --target "$TARGET")
+          # Word splitting is intentional: EXTRA carries several flags or none.
+          if [ -n "${EXTRA:-}" ]; then
+            # shellcheck disable=SC2206
+            args+=($EXTRA)
+          fi
+          echo "+ ${BUILDER} ${args[*]}"
+          case "$BUILDER" in
+            cross) cross "${args[@]}" ;;
+            *)     cargo "${args[@]}" ;;
+          esac
+
+      - name: Report size and file type
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${TARGET}/release/${BIN}${EXT}"
+          ls -l "$bin"
+          du -h "$bin"
+          file "$bin" || true
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="$RUNNER_TEMP/staging"
+          rm -rf "$staging"
+          mkdir -p "$staging" dist
+          cp "target/${TARGET}/release/${BIN}${EXT}" "$staging/"
+          cp README.md LICENSE "$staging/"
+          case "$TARGET" in
+            *linux*) mkdir -p "$staging/deploy"
+                     cp deploy/redis-honeypot-rs.service deploy/config.example.toml "$staging/deploy/" ;;
+          esac
+          tar -czf "dist/${BIN}-${VERSION}-${TARGET}.tar.gz" -C "$staging" .
+          ls -l dist
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $staging = Join-Path $env:RUNNER_TEMP 'staging'
+          if (Test-Path $staging) { Remove-Item -Recurse -Force $staging }
+          New-Item -ItemType Directory -Force -Path $staging, dist | Out-Null
+          Copy-Item "target/$env:TARGET/release/$env:BIN$env:EXT" $staging
+          Copy-Item README.md, LICENSE $staging
+          $archive = "dist/$env:BIN-$env:VERSION-$env:TARGET.zip"
+          Compress-Archive -Path "$staging/*" -DestinationPath $archive -Force
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Upload the archive as an Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN }}-${{ env.VERSION }}-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: attach archives to the release
+    if: github.event_name == 'release'
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          ls -l dist
+          cd dist
+          sha256sum ./* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | "\(.name)  \(.size) bytes"'

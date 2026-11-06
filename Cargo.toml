@@ -41,8 +41,11 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = "symbols"
+strip = "debuginfo"
+debug = false
 incremental = false
+overflow-checks = false
 
+# Dependencies get the same size treatment; they are ~90% of the binary.
 [profile.release.package."*"]
 opt-level = "z"
