@@ -142,10 +142,9 @@ async fn per_connection_command_limit_is_enforced() {
             closed = true;
             break;
         }
-        if tokio::time::timeout(Duration::from_millis(200), c.reply())
-            .await
-            .is_err()
-        {
+        // A close can arrive before any client-side timeout, so this must not
+        // treat EOF as a failure to read.
+        if c.try_reply(Duration::from_millis(300)).await.is_none() {
             closed = true;
             break;
         }

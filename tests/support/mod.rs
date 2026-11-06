@@ -234,6 +234,27 @@ impl Conn {
         self.reply().await
     }
 
+    /// Read one reply, or `None` if the peer closed or nothing arrived in time.
+    ///
+    /// Never panics: tests that expect a close use this instead of `reply`,
+    /// where the EOF can legitimately arrive before any client-side timeout.
+    pub async fn try_reply(&mut self, wait: std::time::Duration) -> Option<Vec<u8>> {
+        tokio::time::timeout(wait, async {
+            loop {
+                if let Some(end) = value_end(&self.buf, 0) {
+                    return Some(self.buf.drain(..end).collect::<Vec<u8>>());
+                }
+                let mut chunk = [0u8; 1024];
+                match self.stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return None,
+                    Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+        })
+        .await
+        .unwrap_or(None)
+    }
+
     /// True when the peer has closed (EOF or reset) within the timeout.
     pub async fn closed(&mut self) -> bool {
         if !self.buf.is_empty() {
