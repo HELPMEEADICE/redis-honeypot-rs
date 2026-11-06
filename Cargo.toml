@@ -36,6 +36,11 @@ rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 toml = "1.2"
 
+[build-dependencies]
+# Only used by build.rs to compile a getrandom(2) shim for mips; no other
+# target invokes a C compiler of its own.
+cc = "1"
+
 [profile.release]
 opt-level = "z"
 lto = "fat"
