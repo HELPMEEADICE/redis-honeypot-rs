@@ -10,7 +10,8 @@
     "extra_args": "",
     "ext": "",
     "apt": "",
-    "timeout": 30
+    "timeout": 30,
+    "rustflags": ""
   },
   {
     "name": "linux-aarch64",
@@ -23,7 +24,8 @@
     "extra_args": "",
     "ext": "",
     "apt": "",
-    "timeout": 40
+    "timeout": 40,
+    "rustflags": ""
   },
   {
     "name": "linux-armv7",
@@ -36,7 +38,8 @@
     "extra_args": "",
     "ext": "",
     "apt": "",
-    "timeout": 40
+    "timeout": 40,
+    "rustflags": ""
   },
   {
     "name": "linux-riscv64",
@@ -49,7 +52,8 @@
     "extra_args": "",
     "ext": "",
     "apt": "",
-    "timeout": 40
+    "timeout": 40,
+    "rustflags": ""
   },
   {
     "name": "linux-mips",
@@ -62,7 +66,8 @@
     "extra_args": "-Z build-std=std,panic_abort",
     "ext": "",
     "apt": "",
-    "timeout": 60
+    "timeout": 60,
+    "rustflags": "--cfg getrandom_backend=\"linux_getrandom\""
   },
   {
     "name": "macos-x86_64",
@@ -75,7 +80,8 @@
     "extra_args": "",
     "ext": "",
     "apt": "",
-    "timeout": 30
+    "timeout": 30,
+    "rustflags": ""
   },
   {
     "name": "macos-aarch64",
@@ -88,7 +94,8 @@
     "extra_args": "",
     "ext": "",
     "apt": "",
-    "timeout": 30
+    "timeout": 30,
+    "rustflags": ""
   },
   {
     "name": "windows-x86_64",
@@ -101,7 +108,8 @@
     "extra_args": "",
     "ext": ".exe",
     "apt": "",
-    "timeout": 30
+    "timeout": 30,
+    "rustflags": ""
   },
   {
     "name": "windows-aarch64",
@@ -114,6 +122,7 @@
     "extra_args": "",
     "ext": ".exe",
     "apt": "",
-    "timeout": 30
+    "timeout": 30,
+    "rustflags": ""
   }
 ]

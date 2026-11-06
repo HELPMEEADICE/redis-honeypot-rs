@@ -141,6 +141,9 @@ jobs:
         env:
           BUILDER: ${{ matrix.builder }}
           EXTRA: ${{ matrix.extra_args }}
+          # mips needs getrandom's syscall backend: the mips image's glibc predates
+          # getrandom(2), so linking against libc's symbol fails.
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           set -euo pipefail
           args=(build --release --locked --target "$TARGET")
