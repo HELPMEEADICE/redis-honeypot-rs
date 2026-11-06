@@ -5,6 +5,10 @@ name: Build
 #   * release published  -> build, then attach every archive to that release
 #   * workflow_dispatch  -> build, archives downloadable from the run page
 #
+# The target list lives in .github/targets.json so it can be reviewed as data;
+# `setup` filters it and feeds the build job a computed matrix, which is what
+# lets `only` skip runners entirely instead of starting then idling them.
+#
 # The size profile lives in Cargo.toml ([profile.release]); Actions cannot
 # override a profile per job, so the manifest is the single source of truth:
 #   opt-level="z" lto="fat" codegen-units=1 panic="abort"
@@ -24,8 +28,6 @@ on:
         required: false
         default: ""
 
-# Never cancel a release build half-way; a manual run for the same ref does not
-# need to queue behind an older one of itself.
 concurrency:
   group: build-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: false
@@ -39,152 +41,63 @@ env:
 
 jobs:
   setup:
-    name: resolve version
+    name: resolve version and matrix
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.resolve.outputs.version }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      count: ${{ steps.resolve.outputs.count }}
     steps:
       - uses: actions/checkout@v4
       - id: resolve
         shell: bash
         env:
           OVERRIDE: ${{ inputs.version-override }}
+          ONLY: ${{ inputs.only }}
         run: |
           set -euo pipefail
+
           version="${OVERRIDE:-}"
           if [ -z "$version" ]; then
             version=$(cargo metadata --no-deps --format-version 1 --locked \
               | jq -r '.packages[] | select(.name == "redis-honeypot-rs") | .version')
           fi
           [ -n "$version" ] || { echo "could not resolve the crate version" >&2; exit 1; }
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "building version $version"
+
+          matrix=$(jq -c '.' .github/targets.json)
+          if [ -n "${ONLY:-}" ]; then
+            matrix=$(jq -c --arg only "$ONLY" '
+              ($only | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $want
+              | [ .[] | select(.name as $n | $want | index($n)) ]
+            ' .github/targets.json)
+          fi
+
+          count=$(printf '%s' "$matrix" | jq 'length')
+          if [ "$count" -eq 0 ]; then
+            echo "no target matched only=\"${ONLY}\"; valid names:" >&2
+            jq -r '.[].name' .github/targets.json >&2
+            exit 1
+          fi
+
+          {
+            echo "version=$version"
+            echo "matrix=$matrix"
+            echo "count=$count"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "version: $version   targets: $count"
+          printf '%s' "$matrix" | jq -r '.[] | "  - \(.name)  \(.target)  on \(.os)  via \(.builder)"'
 
   build:
     name: ${{ matrix.name }}
     needs: setup
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
-    # `only` lets a single target be rebuilt without paying for all nine.
-    if: |
-      inputs.only == '' ||
-      contains(format(',{0},', inputs.only), format(',{0},', matrix.name))
     strategy:
+      # One broken target must not hide the other eight.
       fail-fast: false
       matrix:
-        include:
-          # ---- linux -------------------------------------------------------
-          - name: linux-x86_64
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            builder: cargo
-            toolchain: stable
-            install_target: x86_64-unknown-linux-gnu
-            components: ""
-            extra_args: ""
-            ext: ""
-            apt: ""
-            timeout: 30
-
-          - name: linux-aarch64
-            os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            builder: cross
-            toolchain: stable
-            install_target: aarch64-unknown-linux-gnu
-            components: ""
-            extra_args: ""
-            ext: ""
-            apt: ""
-            timeout: 40
-
-          - name: linux-armv7
-            os: ubuntu-latest
-            target: armv7-unknown-linux-gnueabihf
-            builder: cross
-            toolchain: stable
-            install_target: armv7-unknown-linux-gnueabihf
-            components: ""
-            extra_args: ""
-            ext: ""
-            apt: ""
-            timeout: 40
-
-          - name: linux-riscv64
-            os: ubuntu-latest
-            target: riscv64gc-unknown-linux-gnu
-            builder: cross
-            toolchain: stable
-            install_target: riscv64gc-unknown-linux-gnu
-            components: ""
-            extra_args: ""
-            ext: ""
-            apt: ""
-            timeout: 40
-
-          # Tier 3: no prebuilt std, so nightly + -Z build-std and a real
-          # cross C toolchain for the bundled SQLite (rusqlite "bundled").
-          - name: linux-mips
-            os: ubuntu-latest
-            target: mips-unknown-linux-gnu
-            builder: cargo-build-std
-            toolchain: nightly
-            install_target: ""
-            components: rust-src
-            extra_args: "-Z build-std=std,panic_abort"
-            ext: ""
-            apt: gcc-mips-linux-gnu
-            timeout: 60
-
-          # ---- macos -------------------------------------------------------
-          - name: macos-x86_64
-            os: macos-latest
-            target: x86_64-apple-darwin
-            builder: cargo
-            toolchain: stable
-            install_target: x86_64-apple-darwin
-            components: ""
-            extra_args: ""
-            ext: ""
-            apt: ""
-            timeout: 30
-
-          - name: macos-aarch64
-            os: macos-latest
-            target: aarch64-apple-darwin
-            builder: cargo
-            toolchain: stable
-            install_target: aarch64-apple-darwin
-            components: ""
-            extra_args: ""
-            ext: ""
-            apt: ""
-            timeout: 30
-
-          # ---- windows -----------------------------------------------------
-          - name: windows-x86_64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            builder: cargo
-            toolchain: stable
-            install_target: x86_64-pc-windows-msvc
-            components: ""
-            extra_args: ""
-            ext: ".exe"
-            apt: ""
-            timeout: 30
-
-          - name: windows-aarch64
-            os: windows-latest
-            target: aarch64-pc-windows-msvc
-            builder: cargo
-            toolchain: stable
-            install_target: aarch64-pc-windows-msvc
-            components: ""
-            extra_args: ""
-            ext: ".exe"
-            apt: ""
-            timeout: 30
+        include: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
     env:
       TARGET: ${{ matrix.target }}
@@ -194,7 +107,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Toolchain (target has prebuilt std)
+      - name: Toolchain (target ships a prebuilt std)
         if: matrix.install_target != ''
         uses: dtolnay/rust-toolchain@master
         with:
@@ -202,7 +115,7 @@ jobs:
           targets: ${{ matrix.install_target }}
           components: ${{ matrix.components }}
 
-      - name: Toolchain (build-std, no prebuilt target)
+      - name: Toolchain (tier 3: build std from source)
         if: matrix.install_target == ''
         uses: dtolnay/rust-toolchain@master
         with:
@@ -246,7 +159,7 @@ jobs:
         run: |
           set -euo pipefail
           args=(build --release --locked --target "$TARGET")
-          # Word splitting is intentional: EXTRA carries several flags or none.
+          # Word splitting is intentional: EXTRA carries several flags, or none.
           if [ -n "${EXTRA:-}" ]; then
             # shellcheck disable=SC2206
             args+=($EXTRA)
@@ -277,8 +190,10 @@ jobs:
           cp "target/${TARGET}/release/${BIN}${EXT}" "$staging/"
           cp README.md LICENSE "$staging/"
           case "$TARGET" in
-            *linux*) mkdir -p "$staging/deploy"
-                     cp deploy/redis-honeypot-rs.service deploy/config.example.toml "$staging/deploy/" ;;
+            *linux*)
+              mkdir -p "$staging/deploy"
+              cp deploy/redis-honeypot-rs.service deploy/config.example.toml "$staging/deploy/"
+              ;;
           esac
           tar -czf "dist/${BIN}-${VERSION}-${TARGET}.tar.gz" -C "$staging" .
           ls -l dist
@@ -293,8 +208,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $staging, dist | Out-Null
           Copy-Item "target/$env:TARGET/release/$env:BIN$env:EXT" $staging
           Copy-Item README.md, LICENSE $staging
-          $archive = "dist/$env:BIN-$env:VERSION-$env:TARGET.zip"
-          Compress-Archive -Path "$staging/*" -DestinationPath $archive -Force
+          Compress-Archive -Path "$staging/*" -DestinationPath "dist/$env:BIN-$env:VERSION-$env:TARGET.zip" -Force
           Get-ChildItem dist | Format-Table Name, Length
 
       - name: Upload the archive as an Actions artifact
