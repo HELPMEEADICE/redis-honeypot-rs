@@ -240,7 +240,7 @@ cargo build --release
 | `linux-aarch64` | `aarch64-unknown-linux-gnu` | ubuntu-latest | `cross`（Docker 工具链） |
 | `linux-armv7` | `armv7-unknown-linux-gnueabihf` | ubuntu-latest | `cross` |
 | `linux-riscv64` | `riscv64gc-unknown-linux-gnu` | ubuntu-latest | `cross` |
-| `linux-mips` | `mips-unknown-linux-gnu` | ubuntu-latest | nightly + `-Z build-std=std,panic_abort` + `gcc-mips-linux-gnu` |
+| `linux-mips` | `mips-unknown-linux-gnu` | ubuntu-latest | `cross` + nightly `-Z build-std=std,panic_abort` |
 | `macos-x86_64` | `x86_64-apple-darwin` | macos-latest | 原生 cargo（arm64 主机交叉到 x86_64） |
 | `macos-aarch64` | `aarch64-apple-darwin` | macos-latest | 原生 cargo |
 | `windows-x86_64` | `x86_64-pc-windows-msvc` | windows-latest | 原生 cargo |

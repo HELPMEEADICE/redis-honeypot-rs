@@ -55,13 +55,13 @@
     "name": "linux-mips",
     "os": "ubuntu-latest",
     "target": "mips-unknown-linux-gnu",
-    "builder": "cargo-build-std",
+    "builder": "cross",
     "toolchain": "nightly",
     "install_target": "",
     "components": "rust-src",
     "extra_args": "-Z build-std=std,panic_abort",
     "ext": "",
-    "apt": "gcc-mips-linux-gnu",
+    "apt": "",
     "timeout": 60
   },
   {
