@@ -247,8 +247,20 @@ cargo build --release
 | `windows-aarch64` | `aarch64-pc-windows-msvc` | windows-latest | 原生 cargo + ARM64 MSVC 工具链 |
 
 `linux-mips` 单独处理的原因：`mips-unknown-linux-gnu` 是 tier 3 目标，官方不发布预编译 `std`，
-必须 nightly + `-Z build-std`；同时 rusqlite 的 `bundled` 会编译 SQLite 的 C 代码，所以还需要真正的
-mips GCC 交叉编译器（`gcc-mips-linux-gnu`）与 `CC_mips_unknown_linux_gnu`/链接器环境变量。
+必须 nightly + `-Z build-std`；同时 rusqlite 的 `bundled` 会编译 SQLite 的 C 代码，所以需要一个真正的
+mips 交叉工具链（由 `cross` 的镜像提供——注意 Ubuntu 24.04 已移除 `gcc-mips-linux-gnu` 包）。
+
+mips 还有两个与架构本身有关的坑，都在仓库里解决掉了：
+
+- **没有 64 位原子指令**：`target_has_atomic = "64"` 为假，`AtomicU64` 在该目标上不存在。
+  计数器改为机器字长（见 `src/record.rs` 的 `DropCounter`），在 API 边界再拓宽成 `u64`。
+- **没有 `getrandom(2)`**：glibc 2.24 是最后一个支持 mips o32 的版本，而 `getrandom(2)` 到 2.25 才出现；
+  `std` 与 `getrandom` crate 都无条件引用该符号，链接会报 `undefined reference to 'getrandom'`。
+  `build.rs` 因此只为 `mips*-linux-gnu` 编译一个 5 行的 C shim（`src/shim/getrandom_mips.c`），
+  直接走 `syscall(SYS_getrandom)`；其他目标不编译这段代码（SQLite 之外唯一的一处 C）。
+
+目标清单本身在 `.github/targets.json` 里维护（`setup` 作业读取它、按 `only` 过滤后生成构建矩阵），
+加一个目标只需要往这个 JSON 里加一条记录。
 
 手动触发时可以只构建部分目标，便于排查单个平台：
 
