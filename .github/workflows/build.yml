@@ -19,7 +19,7 @@ on:
     types: [published]
   workflow_dispatch:
     inputs:
-      version-override:
+      version_override:
         description: "Override the version string used in archive names (default: crate version)"
         required: false
         default: ""
@@ -52,7 +52,7 @@ jobs:
       - id: resolve
         shell: bash
         env:
-          OVERRIDE: ${{ inputs.version-override }}
+          OVERRIDE: ${{ inputs.version_override }}
           ONLY: ${{ inputs.only }}
         run: |
           set -euo pipefail
@@ -115,7 +115,7 @@ jobs:
           targets: ${{ matrix.install_target }}
           components: ${{ matrix.components }}
 
-      - name: Toolchain (tier 3: build std from source)
+      - name: "Toolchain (tier 3: build std from source)"
         if: matrix.install_target == ''
         uses: dtolnay/rust-toolchain@master
         with:
