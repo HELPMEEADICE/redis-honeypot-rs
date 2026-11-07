@@ -62,17 +62,41 @@ impl SessionState {
     }
 }
 
-/// Credentials captured from an `AUTH` command. The connection layer applies
-/// the random delay and only then answers `+OK`.
+/// Which command carried the credentials.
+///
+/// Both spellings must be treated identically — same unconditional success, same
+/// random delay, same record — so this is carried explicitly instead of being
+/// inferred from the command name at the storage layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMethod {
+    /// `AUTH <password>` / `AUTH <username> <password>`.
+    Auth,
+    /// `HELLO <proto> AUTH <username> <password>`.
+    Hello,
+}
+
+impl AuthMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::Hello => "hello",
+        }
+    }
+}
+
+/// Credentials captured from an `AUTH`/`HELLO … AUTH` command. The connection
+/// layer applies the random delay and only then answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthAttempt {
+    /// Which command produced this attempt.
+    pub method: AuthMethod,
     pub username: Option<String>,
     /// Length of the password as submitted (always recorded).
     pub password_len: usize,
     /// Raw password, only populated when `record_passwords` is enabled.
     pub password: Option<String>,
-    /// 1 for `AUTH password`, 2 for `AUTH user password`.
-    pub arg_count: u8,
+    /// Arguments of the carrying command (`AUTH`: 2 or 3, `HELLO`: all of them).
+    pub arg_count: u16,
 }
 
 /// Everything the connection layer needs after one command.
@@ -484,7 +508,10 @@ mod tests {
         let attempt = one.auth.expect("auth attempt for AUTH pass");
         assert_eq!(attempt.password_len, 7);
         assert_eq!(attempt.username, None);
-        assert_eq!(attempt.arg_count, 1);
+        // `arg_count` counts the whole command, like `commands.arg_count` does:
+        // `AUTH <password>` is two arguments, `AUTH <user> <password>` is three.
+        assert_eq!(attempt.arg_count, 2);
+        assert_eq!(attempt.method, super::AuthMethod::Auth);
         assert_eq!(attempt.password, None, "record_passwords is off");
 
         let two = say(&mut session, &limits, &["AUTH", "admin", "s3cret"]);
@@ -492,7 +519,7 @@ mod tests {
         let attempt = two.auth.expect("auth attempt for AUTH user pass");
         assert_eq!(attempt.username.as_deref(), Some("admin"));
         assert_eq!(attempt.password_len, 6);
-        assert_eq!(attempt.arg_count, 2);
+        assert_eq!(attempt.arg_count, 3);
         assert_eq!(attempt.password, None);
         assert_eq!(session.auth_attempts, 2);
 
@@ -1478,6 +1505,139 @@ mod tests {
         let attempt = recorded.auth.expect("auth attempt");
         assert_eq!(attempt.password.as_deref(), Some("swordfish"));
         assert_eq!(attempt.password_len, 9);
+    }
+
+    // ------------------------------------------------- HELLO AUTH (regr.)
+
+    /// `HELLO 2/3 … AUTH user pass` is a credential attempt, not a decoration:
+    /// it must produce the same attempt record as `AUTH`, with its own method
+    /// label, and it must still succeed unconditionally.
+    #[test]
+    fn hello_auth_is_captured_like_auth() {
+        let limits = Limits::default();
+        let mut session = new_session(&limits);
+
+        // No AUTH option: only the protocol is negotiated.
+        let plain = say(&mut session, &limits, &["HELLO", "3"]);
+        assert_eq!(session.resp_version, 3);
+        assert!(plain.auth.is_none(), "HELLO without AUTH is not an attempt");
+        assert_eq!(session.auth_attempts, 0);
+
+        let hello3 = say(
+            &mut session,
+            &limits,
+            &["HELLO", "3", "AUTH", "default", "hunter2"],
+        );
+        let attempt = hello3.auth.expect("HELLO 3 AUTH must be recorded");
+        assert_eq!(attempt.method, super::AuthMethod::Hello);
+        assert_eq!(attempt.username.as_deref(), Some("default"));
+        assert_eq!(attempt.password_len, 7);
+        assert_eq!(attempt.password, None, "record_passwords is off");
+        assert_eq!(attempt.arg_count, 5, "the whole HELLO command");
+        assert!(session.authenticated);
+        assert_eq!(session.auth_attempts, 1);
+
+        let hello2 = say(
+            &mut session,
+            &limits,
+            &["HELLO", "2", "AUTH", "root", "pass"],
+        );
+        let attempt = hello2.auth.expect("HELLO 2 AUTH must be recorded");
+        assert_eq!(attempt.username.as_deref(), Some("root"));
+        assert_eq!(attempt.password_len, 4);
+        assert_eq!(session.resp_version, 2);
+        assert_eq!(session.auth_attempts, 2);
+
+        // `SETNAME` is applied, in either order.
+        let named = say(
+            &mut session,
+            &limits,
+            &["HELLO", "3", "SETNAME", "scanner", "AUTH", "admin", "pw"],
+        );
+        assert!(named.auth.is_some(), "the options are order independent");
+        assert_eq!(session.client_name.as_deref(), Some(b"scanner".as_slice()));
+    }
+
+    /// Malformed HELLO option lists are refused like a real server, and a refused
+    /// HELLO must not fabricate an attempt.
+    #[test]
+    fn hello_option_errors_are_reported_and_not_recorded() {
+        let limits = Limits::default();
+        let mut session = new_session(&limits);
+
+        for (args, needle) in [
+            (vec!["HELLO", "3", "AUTH", "user"], "AUTH"),
+            (vec!["HELLO", "3", "AUTH"], "AUTH"),
+            (vec!["HELLO", "3", "SETNAME"], "SETNAME"),
+            (vec!["HELLO", "3", "BOGUS", "x"], "BOGUS"),
+        ] {
+            let reply = say(&mut session, &limits, &args);
+            match reply.reply {
+                RespFrame::Error(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes).to_string();
+                    assert!(
+                        text.contains("Syntax error") && text.contains(needle),
+                        "{args:?} produced {text:?}"
+                    );
+                }
+                other => panic!("{args:?} must be a syntax error, got {other:?}"),
+            }
+            assert!(reply.auth.is_none(), "{args:?} must not record an attempt");
+        }
+        assert_eq!(session.auth_attempts, 0);
+        assert!(!session.authenticated);
+
+        // An unsupported protocol version stays NOPROTO, with or without AUTH.
+        for args in [
+            vec!["HELLO", "4"],
+            vec!["HELLO", "4", "AUTH", "u", "p"],
+            vec!["HELLO", "x"],
+        ] {
+            let reply = say(&mut session, &limits, &args);
+            match reply.reply {
+                RespFrame::Error(bytes) => assert!(
+                    String::from_utf8_lossy(&bytes).contains("NOPROTO"),
+                    "{args:?} must be NOPROTO"
+                ),
+                other => panic!("{args:?} must be NOPROTO, got {other:?}"),
+            }
+            assert!(reply.auth.is_none());
+        }
+        assert_eq!(
+            session.resp_version, 2,
+            "a rejected HELLO keeps the version"
+        );
+    }
+
+    /// With `record_passwords` on, HELLO must store what AUTH stores — and with
+    /// it off, neither may store anything.
+    #[test]
+    fn hello_auth_respects_the_password_recording_switch() {
+        let limits = Limits::default();
+        let mut session = new_session(&limits);
+
+        let masked = say(
+            &mut session,
+            &limits,
+            &["HELLO", "3", "AUTH", "u", "secret"],
+        );
+        assert_eq!(masked.auth.expect("attempt").password, None);
+
+        let recorded = dispatch(
+            &text(&["HELLO", "3", "AUTH", "u", "secret"]),
+            &mut session,
+            &limits,
+            true,
+        );
+        let attempt = recorded.auth.expect("attempt");
+        assert_eq!(attempt.password.as_deref(), Some("secret"));
+        // One switch, one meaning: with recording on, the operator asked for the
+        // raw credential everywhere it is stored, preview included.
+        assert!(
+            recorded.args_preview.contains("secret"),
+            "recording is on, so the preview may show it: {}",
+            recorded.args_preview
+        );
     }
 
     #[test]

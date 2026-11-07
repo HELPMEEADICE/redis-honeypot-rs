@@ -68,6 +68,40 @@ fn jitter_ms(max: u64) -> u64 {
     rand::random_range(0..=max)
 }
 
+/// How a simulated delay ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    /// The whole delay elapsed: the reply is safe to write.
+    Elapsed,
+    /// The peer closed (`FIN`) or reset (`RST`) while we were waiting.
+    ClientGone { reset: bool },
+    /// The server is shutting down.
+    Shutdown,
+}
+
+impl WaitOutcome {
+    /// Label stored in `auth_attempts.meta`, so a cancelled attempt is
+    /// distinguishable from one that was actually delayed.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Elapsed => "ok",
+            Self::ClientGone { reset: false } => "client_fin",
+            Self::ClientGone { reset: true } => "client_reset",
+            Self::Shutdown => "server_shutdown",
+        }
+    }
+
+    /// The close reason this outcome implies, if the connection must end.
+    fn close_reason(self) -> Option<CloseReason> {
+        match self {
+            Self::Elapsed => None,
+            Self::ClientGone { reset: false } => Some(CloseReason::ClientClosed),
+            Self::ClientGone { reset: true } => Some(CloseReason::IoError),
+            Self::Shutdown => Some(CloseReason::ServerShutdown),
+        }
+    }
+}
+
 /// Everything one in-flight command needs, bundled so the per-frame helpers do
 /// not grow a nine argument signature.
 struct ConnCtx<'a> {
@@ -93,9 +127,29 @@ impl ConnCtx<'_> {
     /// force at the moment it is encoded.
     async fn reply(&mut self, frame: &RespFrame) -> Result<(), CloseReason> {
         let resp3 = self.resp3();
+        // A reply is built in full before it is written, so its length is this
+        // connection's peak memory. The cap is derived from configuration and is
+        // a real upper bound for anything the simulator can produce: one key's
+        // payload (`store_max_value_bytes` <= `max_message_bytes`) plus the
+        // whole store's RESP framing (`store_max_bytes`). Without it, raising
+        // `store_max_value_bytes` would multiply the per-connection peak by
+        // `max_connections`.
+        let reply_cap = self
+            .config
+            .limits
+            .max_message_bytes
+            .saturating_add(self.config.limits.store_max_bytes);
         let buf = &mut *self.out;
         buf.clear();
         encode_frame(frame, resp3, buf);
+        if buf.len() > reply_cap {
+            buf.clear();
+            encode_frame(
+                &RespFrame::error("ERR simulated reply exceeds the configured limit"),
+                resp3,
+                buf,
+            );
+        }
         let stream = &mut *self.stream;
         stream
             .write_all(buf)
@@ -119,16 +173,73 @@ impl ConnCtx<'_> {
         }));
     }
 
-    /// Sleep, but wake up immediately when shutdown is triggered.
+    /// Sleep for `wait`, but return as soon as the peer disappears or the server
+    /// shuts down.
     ///
-    /// Returns `true` when the wait was cut short, in which case the caller must
-    /// stop without writing a reply: the peer is gone anyway.
-    async fn wait_or_shutdown(&mut self, wait: Duration) -> bool {
-        tokio::select! {
-            biased;
-            () = server::shutdown_signal(self.shutdown) => true,
-            () = tokio::time::sleep(wait) => false,
+    /// Disconnect detection uses `peek`, never `read`: a `read` would swallow
+    /// the first bytes of a pipelined command that arrived during the delay and
+    /// silently drop it. `peek` leaves the socket untouched and still reports
+    /// `FIN` (`Ok(0)`) and `RST` (`Err`) the moment they arrive.
+    ///
+    /// Once a pipelined byte *is* buffered, `peek` can no longer observe a later
+    /// `FIN` (the kernel returns the buffered data, not the EOF), so probing is
+    /// switched off for the rest of this wait instead of spinning on level
+    /// triggered readiness. The delay then falls back to the timer.
+    async fn wait_for_delay(&mut self, wait: Duration) -> WaitOutcome {
+        if wait.is_zero() {
+            return WaitOutcome::Elapsed;
         }
+        let Some(deadline) = Instant::now().checked_add(wait) else {
+            return WaitOutcome::Elapsed;
+        };
+
+        // Disjoint field borrows: the select below needs both at once.
+        let stream = &mut *self.stream;
+        let shutdown = &mut *self.shutdown;
+        let mut probe = [0_u8; 1];
+        let mut peekable = true;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return WaitOutcome::Elapsed;
+            }
+            tokio::select! {
+                biased;
+                // A shutdown must cancel every waiting AUTH immediately.
+                () = server::shutdown_signal(shutdown) => return WaitOutcome::Shutdown,
+                result = stream.peek(&mut probe), if peekable => {
+                    match result {
+                        // `FIN`: the peer is gone, nothing left to answer.
+                        Ok(0) => return WaitOutcome::ClientGone { reset: false },
+                        // Buffered pipelined data: stop probing, keep waiting.
+                        Ok(_) => peekable = false,
+                        // `RST` and any other socket error: the peer is gone.
+                        Err(_) => return WaitOutcome::ClientGone { reset: true },
+                    }
+                }
+                () = tokio::time::sleep(remaining) => return WaitOutcome::Elapsed,
+            }
+        }
+    }
+
+    /// The `meta` column for an `auth_attempts` row.
+    ///
+    /// `delay_ms` carries the *planned* delay; this string carries the measured
+    /// wait and the outcome, so statistics cannot mistake a cancelled attempt for
+    /// a completed one.
+    fn auth_meta(
+        attempt: &crate::commands::AuthAttempt,
+        resp_version: u8,
+        planned_ms: u64,
+        waited_ms: u64,
+        outcome: WaitOutcome,
+    ) -> String {
+        format!(
+            "via={};proto={resp_version};planned_ms={planned_ms};waited_ms={waited_ms};outcome={}",
+            attempt.method.as_str(),
+            outcome.as_str()
+        )
     }
 
     /// Turn a decoder/argument failure into a reply, a record and a close reason.
@@ -191,7 +302,12 @@ impl ConnCtx<'_> {
         let result = commands::dispatch(&args, self.session, limits, config.record_passwords);
 
         // ------------------------------------------------- log, then act
-        if result.auth.is_none() {
+        //
+        // `AUTH` is stored as an auth attempt only: repeating it in `commands`
+        // would duplicate the same credentials. `HELLO … AUTH` is both — the
+        // protocol negotiation is a command and the credentials are an attempt —
+        // so it is recorded in both tables, masked in both.
+        if result.auth.is_none() || result.name != "AUTH" {
             self.recorder.emit(Record::Command(CommandRecord {
                 conn_id: self.conn_id,
                 ip: self.peer.ip(),
@@ -224,10 +340,17 @@ impl ConnCtx<'_> {
         // ------------------------------------------- simulated delay
         if let Some(attempt) = result.auth.as_ref() {
             let (min, max) = config.timing.auth_bounds();
-            let delay_ms = auth_delay_ms(min, max);
-            if delay_ms > 0 && self.wait_or_shutdown(Duration::from_millis(delay_ms)).await {
-                return Some(CloseReason::ServerShutdown);
-            }
+            // `delay_ms` is the *planned* simulated delay; the measured wait and
+            // how the wait ended go into `meta`, so an attempt cancelled by a
+            // disconnect is never mistaken for a completed one.
+            let planned_ms = auth_delay_ms(min, max);
+            let started = Instant::now();
+            let outcome = self.wait_for_delay(Duration::from_millis(planned_ms)).await;
+            let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+            // Forensics first: the attempt is recorded even when it was cancelled,
+            // which is exactly the case a scanner creates by hanging up during the
+            // delay. Losing it would hide the technique.
             self.recorder.emit(Record::Auth(AuthRecord {
                 conn_id: self.conn_id,
                 ip: self.peer.ip(),
@@ -244,19 +367,40 @@ impl ConnCtx<'_> {
                     None
                 },
                 simulated_ok: true,
-                delay_ms,
-                meta: None,
+                delay_ms: planned_ms,
+                meta: Some(Self::auth_meta(
+                    attempt,
+                    self.session.resp_version,
+                    planned_ms,
+                    waited_ms,
+                    outcome,
+                )),
             }));
             logging::auth(
                 self.peer,
                 attempt.username.as_deref().unwrap_or(""),
-                delay_ms,
+                planned_ms,
                 true,
             );
+            if let Some(reason) = outcome.close_reason() {
+                logging::notice(
+                    self.peer,
+                    "auth_cancelled",
+                    &format!(
+                        "{} after {waited_ms}ms of a {planned_ms}ms delay",
+                        outcome.as_str()
+                    ),
+                );
+                return Some(reason);
+            }
         } else if config.timing.command_jitter_max_ms > 0 {
             let jitter = jitter_ms(config.timing.command_jitter_max_ms);
-            if jitter > 0 && self.wait_or_shutdown(Duration::from_millis(jitter)).await {
-                return Some(CloseReason::ServerShutdown);
+            if let Some(reason) = self
+                .wait_for_delay(Duration::from_millis(jitter))
+                .await
+                .close_reason()
+            {
+                return Some(reason);
             }
         }
 
@@ -266,8 +410,13 @@ impl ConnCtx<'_> {
         }
 
         // -------------------------------------------- hard per-conn limits
-        if self.session.command_count > limits.max_commands_per_conn {
-            let _ = self.reply(&RespFrame::error("ERR too many commands")).await;
+        //
+        // Both limits are checked *after* the command ran, and both compare with
+        // `>=` against a counter that was incremented by this command, so exactly
+        // `max_*` commands/attempts are served and the next one closes the
+        // connection. Mixing `>` here and `>=` there used to let one extra
+        // command through.
+        if self.session.command_count >= limits.max_commands_per_conn {
             logging::notice(self.peer, "limit", "command limit reached");
             return Some(CloseReason::CommandLimit);
         }
@@ -296,7 +445,7 @@ pub async fn handle_connection(
     shared: Arc<SharedState>,
     shutdown: ShutdownHandle,
 ) -> HandleOutcome {
-    let config = shared.config.clone();
+    let config = shared.config();
     let recorder = shared.recorder.clone();
 
     let mut session = SessionState::new(conn_id, peer.ip(), peer.port(), shared.store.clone());

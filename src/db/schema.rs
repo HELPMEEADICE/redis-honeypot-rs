@@ -4,7 +4,14 @@
 use rusqlite::Connection;
 
 /// Current schema version, stored in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// * 1 — the four telemetry tables.
+/// * 2 — adds `writer_stats`, the single row that persists the writer's own
+///   health counters so a later `stats` run can report them.
+///
+/// The DDL is additive and idempotent, so a version 1 database is upgraded in
+/// place by simply running [`init`] again.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Create tables and indexes if they do not exist, and stamp the schema version.
 pub fn init(conn: &Connection) -> rusqlite::Result<()> {
@@ -72,6 +79,20 @@ CREATE TABLE IF NOT EXISTS security_events (
 );
 CREATE INDEX IF NOT EXISTS idx_security_ip ON security_events(ip);
 CREATE INDEX IF NOT EXISTS idx_security_kind_ts ON security_events(kind, ts);
+
+-- Writer health. Exactly one row (id = 1), rewritten by the writer itself, so
+-- the counters survive the process that produced them and a separate `stats`
+-- run can report how much telemetry was lost rather than guessing.
+CREATE TABLE IF NOT EXISTS writer_stats (
+    id                 INTEGER PRIMARY KEY CHECK (id = 1),
+    updated_at         INTEGER NOT NULL,
+    lost               INTEGER NOT NULL DEFAULT 0,
+    retried            INTEGER NOT NULL DEFAULT 0,
+    retry_failed       INTEGER NOT NULL DEFAULT 0,
+    pruned_rows        INTEGER NOT NULL DEFAULT 0,
+    vacuum_pages       INTEGER NOT NULL DEFAULT 0,
+    checkpoint_blocked INTEGER NOT NULL DEFAULT 0
+);
 "#;
 
 #[cfg(test)]
@@ -95,7 +116,7 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("count tables");
-        assert_eq!(count, 4, "four logical tables expected");
+        assert_eq!(count, 5, "four telemetry tables plus writer_stats");
     }
 
     #[test]
@@ -184,6 +205,19 @@ mod tests {
         assert_eq!(
             cols("security_events"),
             vec!["id", "conn_id", "ts", "ip", "kind", "command", "detail"]
+        );
+        assert_eq!(
+            cols("writer_stats"),
+            vec![
+                "id",
+                "updated_at",
+                "lost",
+                "retried",
+                "retry_failed",
+                "pruned_rows",
+                "vacuum_pages",
+                "checkpoint_blocked"
+            ]
         );
     }
 }

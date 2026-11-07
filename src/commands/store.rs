@@ -4,13 +4,36 @@
 //! enforced on every mutation: an attacker can never grow the honeypot's RSS by
 //! pushing large values or millions of keys.
 //!
+//! # The resource model
+//!
+//! Charging only `value.len()` per element is not enough. `RPUSH k "" "" ""`
+//! carries zero payload bytes but still allocates one `Vec<u8>` header per
+//! element, grows the deque's backing store and adds allocator bookkeeping. Two
+//! numbers are therefore kept apart on purpose:
+//!
+//! * [`StoreValue::payload_bytes`] — the *logical* size, i.e. what real Redis
+//!   would report for `STRLEN`/`MEMORY USAGE`-ish accounting. Bounded by
+//!   [`StoreCaps::max_value_bytes`].
+//! * [`StoreValue::charged_bytes`] — the *conservative heap estimate*: the
+//!   payload plus [`ELEMENT_OVERHEAD`] per element. Bounded by
+//!   [`StoreCaps::max_bytes`] together with the key name and [`KEY_OVERHEAD`].
+//!
+//! On top of that, a collection's element count is limited by
+//! [`StoreCaps::max_collection_len`], so an empty-string flood hits a hard wall
+//! instead of being amortised to zero.
+//!
+//! `charged_bytes` is a deliberate *lower bound* on real heap usage: it counts
+//! one allocation per element plus the container node, not the allocator's own
+//! rounding. It is conservative in the direction that matters — it never lets a
+//! write through that the budget was meant to stop.
+//!
 //! The store also owns the *virtual* `CONFIG` map. `CONFIG SET` must answer
 //! plausibly while changing nothing on the host, so the value an attacker sets
 //! has to live somewhere that is shared by every connection but is not the real
 //! process configuration — this keyspace is exactly that place, and it keeps
 //! [`super::dispatch`] a pure function with no global mutable state.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::config::Limits;
@@ -31,12 +54,31 @@ const CONFIG_MAX_ENTRIES: usize = 64;
 const CONFIG_MAX_KEY_BYTES: usize = 128;
 const CONFIG_MAX_VALUE_BYTES: usize = 512;
 
-/// Caps for the virtual keyspace.
+/// Conservative per-element bookkeeping charged against the store budget.
+///
+/// One element is a `Vec<u8>` (24 B header inside the parent container), its
+/// heap allocation (payload + allocator rounding) and, for the `BTreeSet` /
+/// `BTreeMap` variants, the node's links and rebalancing slack. 32 bytes covers
+/// the header plus node bookkeeping; the payload is charged separately. Without
+/// this, a list of empty strings costs nothing while still consuming one
+/// allocation per element.
+pub const ELEMENT_OVERHEAD: usize = 32;
+
+/// Per-key bookkeeping charged against the store budget.
+///
+/// [`Entry`] itself (value enum, deadline, sequence, byte count) plus the
+/// `HashMap` bucket, the `BTreeMap` order node and the `(u8, Vec<u8>)` key with
+/// its own heap allocation.
+pub const KEY_OVERHEAD: usize = 64;
+
+/// Bounds for the virtual keyspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreCaps {
     pub max_keys: usize,
     pub max_bytes: usize,
     pub max_value_bytes: usize,
+    /// Maximum number of elements in one list, set or hash.
+    pub max_collection_len: usize,
     pub max_ttl: Duration,
 }
 
@@ -46,6 +88,7 @@ impl StoreCaps {
             max_keys: limits.store_max_keys,
             max_bytes: limits.store_max_bytes,
             max_value_bytes: limits.store_max_value_bytes,
+            max_collection_len: limits.store_max_collection_len,
             max_ttl: Duration::from_secs(limits.store_max_ttl_secs),
         }
     }
@@ -63,6 +106,8 @@ impl Default for StoreCaps {
 pub enum StoreError {
     /// A single value (or key + value) is larger than the configured cap.
     ValueTooLarge { size: usize, max: usize },
+    /// A collection would hold more elements than the configured cap.
+    TooManyElements { count: usize, max: usize },
     /// The key holds a different kind of value than the command needs.
     WrongType,
     /// The value is not a base-10 `i64`.
@@ -73,10 +118,14 @@ pub enum StoreError {
 
 /// One virtual value. Keys, members and fields are raw bytes throughout: a
 /// honeypot must never lossily convert what an attacker stored.
+///
+/// Lists are a [`VecDeque`] and not a [`Vec`]: `LPUSH` on a `Vec` is
+/// `insert(0, …)`, which shifts the whole list, and repeating it turns a
+/// thousand-element push into quadratic work. `push_front` is amortised `O(1)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreValue {
     Str(Vec<u8>),
-    List(Vec<Vec<u8>>),
+    List(VecDeque<Vec<u8>>),
     Set(BTreeSet<Vec<u8>>),
     Hash(BTreeMap<Vec<u8>, Vec<u8>>),
 }
@@ -92,15 +141,52 @@ impl StoreValue {
         }
     }
 
-    /// Bytes charged against [`StoreCaps::max_value_bytes`].
+    /// Logical data bytes: what the attacker actually stored.
+    ///
+    /// Saturating throughout: an element's length always fits, but the *sum*
+    /// must not be able to wrap (release builds have `overflow-checks = false`,
+    /// so a wrapping sum would silently under-report and defeat the cap).
     fn payload_bytes(&self) -> usize {
         match self {
             Self::Str(value) => value.len(),
-            Self::List(items) => items.iter().map(Vec::len).sum(),
-            Self::Set(members) => members.iter().map(Vec::len).sum(),
-            Self::Hash(fields) => fields.iter().map(|(f, v)| f.len() + v.len()).sum(),
+            Self::List(items) => items
+                .iter()
+                .fold(0_usize, |acc, item| acc.saturating_add(item.len())),
+            Self::Set(members) => members
+                .iter()
+                .fold(0_usize, |acc, member| acc.saturating_add(member.len())),
+            Self::Hash(fields) => fields.iter().fold(0_usize, |acc, (field, value)| {
+                acc.saturating_add(field.len()).saturating_add(value.len())
+            }),
         }
     }
+
+    /// Number of allocated elements (always 1 for a string).
+    fn element_count(&self) -> usize {
+        match self {
+            Self::Str(_) => 1,
+            Self::List(items) => items.len(),
+            Self::Set(members) => members.len(),
+            Self::Hash(fields) => fields.len(),
+        }
+    }
+
+    /// Conservative heap estimate: payload plus per-element bookkeeping.
+    fn charged_bytes(&self) -> usize {
+        charged_bytes(self.payload_bytes(), self.element_count())
+    }
+}
+
+/// `payload + count * ELEMENT_OVERHEAD`, saturating.
+fn charged_bytes(payload: usize, count: usize) -> usize {
+    payload.saturating_add(count.saturating_mul(ELEMENT_OVERHEAD))
+}
+
+/// Total charge for one key: name, entry bookkeeping and the value itself.
+fn charged_entry_bytes(key_len: usize, value: &StoreValue) -> usize {
+    key_len
+        .saturating_add(KEY_OVERHEAD)
+        .saturating_add(value.charged_bytes())
 }
 
 #[derive(Debug)]
@@ -109,7 +195,7 @@ struct Entry {
     expire_at: Option<Instant>,
     /// Insertion order ticket; also the key into [`VirtualStore::order`].
     seq: u64,
-    /// `key.len() + value.payload_bytes()`, the charge against `total_bytes`.
+    /// [`charged_entry_bytes`] for the key this entry now lives under.
     bytes: usize,
 }
 
@@ -149,6 +235,16 @@ impl VirtualStore {
 
     pub fn caps(&self) -> StoreCaps {
         self.caps
+    }
+
+    /// Replace the caps at runtime (hot reload).
+    ///
+    /// A lowered budget takes effect immediately: the oldest keys are evicted
+    /// right here rather than at the next write, so `CONFIG`-time promises match
+    /// what the process actually holds.
+    pub fn set_caps(&mut self, caps: StoreCaps) {
+        self.caps = caps;
+        self.make_room(0, 0);
     }
 
     /// How long this store has existed, used by `INFO server` uptime fields.
@@ -219,6 +315,10 @@ impl VirtualStore {
     }
 
     /// Append/replace a whole [`StoreValue`], preserving `expire_at`.
+    ///
+    /// Every cap is checked *before* the store is touched, so a refused write
+    /// leaves the previous value, its TTL and the byte accounting exactly as
+    /// they were.
     fn store_value(
         &mut self,
         db: u8,
@@ -226,51 +326,100 @@ impl VirtualStore {
         value: StoreValue,
         expire_at: Option<Instant>,
     ) -> Result<(), StoreError> {
-        let payload = value.payload_bytes();
+        self.check_write(key.len(), &value)?;
+        let map_key: MapKey = (db, key.to_vec());
+        let entry = match self.take_entry(&map_key) {
+            Some(mut entry) => {
+                entry.value = value;
+                entry.expire_at = expire_at;
+                entry
+            }
+            None => self.new_entry(value, expire_at),
+        };
+        self.put_entry(map_key, entry);
+        Ok(())
+    }
+
+    // ------------------------------------------------------- write pre-flight
+
+    /// Would `value` under `key_len` fit the caps? Nothing is mutated.
+    fn check_write(&self, key_len: usize, value: &StoreValue) -> Result<(), StoreError> {
+        self.check_projected(key_len, value.payload_bytes(), value.element_count())
+    }
+
+    /// The same three checks, from projected numbers, so an incremental
+    /// mutation can be validated before it changes anything.
+    fn check_projected(
+        &self,
+        key_len: usize,
+        payload: usize,
+        count: usize,
+    ) -> Result<(), StoreError> {
         if payload > self.caps.max_value_bytes {
             return Err(StoreError::ValueTooLarge {
                 size: payload,
                 max: self.caps.max_value_bytes,
             });
         }
-        let entry_bytes = key.len().saturating_add(payload);
-        if entry_bytes > self.caps.max_bytes {
+        if count > self.caps.max_collection_len {
+            return Err(StoreError::TooManyElements {
+                count,
+                max: self.caps.max_collection_len,
+            });
+        }
+        let charged = key_len
+            .saturating_add(KEY_OVERHEAD)
+            .saturating_add(charged_bytes(payload, count));
+        // A value that can never fit, even with the whole store emptied, is
+        // refused up front: evicting everything and *then* failing would be a
+        // side effect of a write that never happened.
+        if charged > self.caps.max_bytes {
             return Err(StoreError::ValueTooLarge {
-                size: entry_bytes,
+                size: charged,
                 max: self.caps.max_bytes,
             });
         }
-
-        let map_key: MapKey = (db, key.to_vec());
-        // Take the old entry out first: eviction must never be able to reclaim
-        // the slot we are about to write, and the byte accounting stays exact.
-        let previous = self.entries.remove(&map_key);
-        let (seq, is_new) = match previous.as_ref() {
-            Some(entry) => {
-                self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
-                (entry.seq, false)
-            }
-            None => {
-                let seq = self.next_seq;
-                self.next_seq = self.next_seq.wrapping_add(1).max(1);
-                (seq, true)
-            }
-        };
-
-        self.make_room(entry_bytes, usize::from(is_new));
-
-        self.total_bytes = self.total_bytes.saturating_add(entry_bytes);
-        self.order.insert(seq, map_key.clone());
-        self.entries.insert(
-            map_key,
-            Entry {
-                value,
-                expire_at,
-                seq,
-                bytes: entry_bytes,
-            },
-        );
         Ok(())
+    }
+
+    // ---------------------------------------------------------- entry plumbing
+
+    /// Mint a sequence number for a brand new entry.
+    fn new_entry(&mut self, value: StoreValue, expire_at: Option<Instant>) -> Entry {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1).max(1);
+        Entry {
+            value,
+            expire_at,
+            seq,
+            bytes: 0,
+        }
+    }
+
+    /// Take an entry out of the map so it can be mutated in place.
+    ///
+    /// Removing first buys three things at once: the value is moved, not
+    /// cloned (`LPUSH` would otherwise copy the whole list); [`Self::make_room`]
+    /// can never evict the key currently being rewritten; and the byte
+    /// accounting stays exact even if the caller then gives up.
+    fn take_entry(&mut self, map_key: &MapKey) -> Option<Entry> {
+        let entry = self.entries.remove(map_key)?;
+        self.order.remove(&entry.seq);
+        self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
+        Some(entry)
+    }
+
+    /// Re-insert an entry, evicting *other* keys until the budget fits.
+    ///
+    /// The charge is recomputed from the value that is actually stored, so the
+    /// accounting can never drift away from the contents.
+    fn put_entry(&mut self, map_key: MapKey, mut entry: Entry) {
+        entry.bytes = charged_entry_bytes(map_key.1.len(), &entry.value);
+        // `take_entry` already removed this key, so re-inserting always adds one.
+        self.make_room(entry.bytes, 1);
+        self.total_bytes = self.total_bytes.saturating_add(entry.bytes);
+        self.order.insert(entry.seq, map_key.clone());
+        self.entries.insert(map_key, entry);
     }
 
     // ------------------------------------------------------------- key space
@@ -419,6 +568,11 @@ impl VirtualStore {
     // ------------------------------------------------------------------ lists
 
     /// `LPUSH`/`RPUSH`. Returns the new list length.
+    ///
+    /// The existing list is mutated in place: it is moved out of the map, not
+    /// cloned, and `LPUSH` uses `push_front` instead of `insert(0, …)`, so a
+    /// thousand-element push stays linear instead of quadratic. Every cap is
+    /// validated from the projected size *before* the first element is added.
     pub fn list_push(
         &mut self,
         db: u8,
@@ -429,25 +583,52 @@ impl VirtualStore {
         self.touch();
         self.expire_one(db, key);
         let map_key: MapKey = (db, key.to_vec());
-        let (mut list, expire_at) = match self.entries.get(&map_key) {
-            None => (Vec::new(), None),
+
+        let (payload, count) = match self.entries.get(&map_key) {
+            None => (0, 0),
             Some(entry) => match &entry.value {
-                StoreValue::List(items) => (items.clone(), entry.expire_at),
+                StoreValue::List(items) => (
+                    items
+                        .iter()
+                        .fold(0_usize, |acc, item| acc.saturating_add(item.len())),
+                    items.len(),
+                ),
                 _ => return Err(StoreError::WrongType),
             },
         };
+        if values.is_empty() {
+            return Ok(count);
+        }
+        let added_payload = values
+            .iter()
+            .fold(0_usize, |acc, value| acc.saturating_add(value.len()));
+        self.check_projected(
+            key.len(),
+            payload.saturating_add(added_payload),
+            count.saturating_add(values.len()),
+        )?;
+
+        let mut entry = match self.take_entry(&map_key) {
+            Some(entry) => entry,
+            None => self.new_entry(StoreValue::List(VecDeque::new()), None),
+        };
+        let StoreValue::List(items) = &mut entry.value else {
+            // Unreachable: the type was checked above and the entry was created
+            // as a list above. Restoring it unchanged keeps the store intact if
+            // that ever stops being true.
+            self.put_entry(map_key, entry);
+            return Err(StoreError::WrongType);
+        };
         for value in values {
+            // `LPUSH k a b c` leaves the list as `c b a`.
             if left {
-                // `LPUSH k a b c` leaves the list as `c b a`.
-                list.insert(0, value.clone());
+                items.push_front(value.clone());
             } else {
-                list.push(value.clone());
+                items.push_back(value.clone());
             }
         }
-        let len = list.len();
-        // `store_value` re-checks the payload cap and leaves the store untouched
-        // on failure, so an oversized push cannot corrupt the existing list.
-        self.store_value(db, key, StoreValue::List(list), expire_at)?;
+        let len = items.len();
+        self.put_entry(map_key, entry);
         Ok(len)
     }
 
@@ -492,12 +673,18 @@ impl VirtualStore {
             return Ok(Vec::new());
         }
         let (from, to) = (first as usize, last as usize);
-        Ok(items[from..=to].to_vec())
+        // Cloned on purpose: the reply is serialised after the lock is released,
+        // and the whole result is bounded by the per-key payload cap.
+        Ok(items.range(from..=to).cloned().collect())
     }
 
     // ------------------------------------------------------------------- sets
 
     /// `SADD`. Returns how many members were new.
+    ///
+    /// The set is mutated in place. Membership is resolved *before* the
+    /// mutation so the projected size (and therefore the cap decision) is exact
+    /// rather than an over-estimate of "every argument is new".
     pub fn set_add(
         &mut self,
         db: u8,
@@ -507,20 +694,64 @@ impl VirtualStore {
         self.touch();
         self.expire_one(db, key);
         let map_key: MapKey = (db, key.to_vec());
-        let (mut set, expire_at) = match self.entries.get(&map_key) {
-            None => (BTreeSet::new(), None),
+
+        let (payload, count) = match self.entries.get(&map_key) {
+            None => (0, 0),
             Some(entry) => match &entry.value {
-                StoreValue::Set(members) => (members.clone(), entry.expire_at),
+                StoreValue::Set(set) => (
+                    set.iter()
+                        .fold(0_usize, |acc, member| acc.saturating_add(member.len())),
+                    set.len(),
+                ),
                 _ => return Err(StoreError::WrongType),
             },
         };
+
+        // Exact projection: skip what is already a member and collapse repeats
+        // inside `members` itself. The borrow of the stored set ends with this
+        // block, before anything is mutated.
+        let mut incoming: BTreeSet<&Vec<u8>> = BTreeSet::new();
+        {
+            let existing = match self.entries.get(&map_key) {
+                Some(entry) => match &entry.value {
+                    StoreValue::Set(set) => Some(set),
+                    _ => None,
+                },
+                None => None,
+            };
+            for member in members {
+                if !existing.is_some_and(|set| set.contains(member)) {
+                    incoming.insert(member);
+                }
+            }
+        }
+        let added_payload = incoming
+            .iter()
+            .fold(0_usize, |acc, member| acc.saturating_add(member.len()));
+        self.check_projected(
+            key.len(),
+            payload.saturating_add(added_payload),
+            count.saturating_add(incoming.len()),
+        )?;
+        if incoming.is_empty() {
+            return Ok(0);
+        }
+
+        let mut entry = match self.take_entry(&map_key) {
+            Some(entry) => entry,
+            None => self.new_entry(StoreValue::Set(BTreeSet::new()), None),
+        };
+        let StoreValue::Set(set) = &mut entry.value else {
+            self.put_entry(map_key, entry);
+            return Err(StoreError::WrongType);
+        };
         let mut added = 0;
-        for member in members {
+        for member in incoming {
             if set.insert(member.clone()) {
                 added += 1;
             }
         }
-        self.store_value(db, key, StoreValue::Set(set), expire_at)?;
+        self.put_entry(map_key, entry);
         Ok(added)
     }
 
@@ -541,6 +772,10 @@ impl VirtualStore {
     // ----------------------------------------------------------------- hashes
 
     /// `HSET`. Returns how many fields were new.
+    ///
+    /// Same in-place contract as [`Self::set_add`]: the projected size is exact
+    /// (a replaced field only changes the payload delta) and every cap is
+    /// checked before the map is touched.
     pub fn hash_set(
         &mut self,
         db: u8,
@@ -550,20 +785,72 @@ impl VirtualStore {
         self.touch();
         self.expire_one(db, key);
         let map_key: MapKey = (db, key.to_vec());
-        let (mut hash, expire_at) = match self.entries.get(&map_key) {
-            None => (BTreeMap::new(), None),
+
+        let (payload, count) = match self.entries.get(&map_key) {
+            None => (0, 0),
             Some(entry) => match &entry.value {
-                StoreValue::Hash(fields) => (fields.clone(), entry.expire_at),
+                StoreValue::Hash(fields) => (
+                    fields.iter().fold(0_usize, |acc, (field, value)| {
+                        acc.saturating_add(field.len()).saturating_add(value.len())
+                    }),
+                    fields.len(),
+                ),
                 _ => return Err(StoreError::WrongType),
             },
         };
-        let mut added = 0;
+
+        // Collapse repeats first: the last one wins, exactly like `HSET` on a
+        // real server, so it must be charged once and counted once.
+        let mut incoming: BTreeMap<&Vec<u8>, &Vec<u8>> = BTreeMap::new();
         for (field, value) in pairs {
-            if hash.insert(field.clone(), value.clone()).is_none() {
+            incoming.insert(field, value);
+        }
+        let mut new_payload = payload;
+        let mut new_count = count;
+        {
+            let existing = match self.entries.get(&map_key) {
+                Some(entry) => match &entry.value {
+                    StoreValue::Hash(fields) => Some(fields),
+                    _ => None,
+                },
+                None => None,
+            };
+            for (field, value) in &incoming {
+                match existing.and_then(|fields| fields.get(*field)) {
+                    Some(old) => {
+                        new_payload = new_payload
+                            .saturating_sub(old.len())
+                            .saturating_add(value.len());
+                    }
+                    None => {
+                        new_payload = new_payload
+                            .saturating_add(field.len())
+                            .saturating_add(value.len());
+                        new_count = new_count.saturating_add(1);
+                    }
+                }
+            }
+        }
+        self.check_projected(key.len(), new_payload, new_count)?;
+        if incoming.is_empty() {
+            return Ok(0);
+        }
+
+        let mut entry = match self.take_entry(&map_key) {
+            Some(entry) => entry,
+            None => self.new_entry(StoreValue::Hash(BTreeMap::new()), None),
+        };
+        let StoreValue::Hash(fields) = &mut entry.value else {
+            self.put_entry(map_key, entry);
+            return Err(StoreError::WrongType);
+        };
+        let mut added = 0;
+        for (field, value) in incoming {
+            if fields.insert(field.clone(), value.clone()).is_none() {
                 added += 1;
             }
         }
-        self.store_value(db, key, StoreValue::Hash(hash), expire_at)?;
+        self.put_entry(map_key, entry);
         Ok(added)
     }
 
@@ -811,8 +1098,28 @@ mod tests {
             max_keys,
             max_bytes,
             max_value_bytes,
+            max_collection_len: Limits::default().store_max_collection_len,
             max_ttl: Duration::from_secs(3_600),
         })
+    }
+
+    /// A store whose collection element cap is easy to hit in a test.
+    fn store_with_elements(max_elements: usize) -> VirtualStore {
+        VirtualStore::new(StoreCaps {
+            max_keys: 16,
+            max_bytes: 1 << 20,
+            max_value_bytes: 1 << 16,
+            max_collection_len: max_elements,
+            max_ttl: Duration::from_secs(3_600),
+        })
+    }
+
+    /// The charge a single key with an empty-string list of `count` elements
+    /// should carry: this is the number the empty-element flood has to move.
+    fn empty_list_charge(key: &[u8], count: usize) -> usize {
+        key.len()
+            .saturating_add(KEY_OVERHEAD)
+            .saturating_add(charged_bytes(0, count))
     }
 
     #[test]
@@ -860,9 +1167,16 @@ mod tests {
         assert_eq!(s.ttl(0, b"k"), 1);
         s.set_ex(0, b"gone", b"v".to_vec(), Some(Duration::from_millis(1)))
             .expect("set");
+        let with_two = s.total_bytes();
         std::thread::sleep(Duration::from_millis(10));
         assert_eq!(s.get(0, b"gone").expect("get"), None);
-        assert_eq!(s.total_bytes(), 2, "the expired entry released its bytes");
+        // The surviving key is charged its own name, bookkeeping and payload.
+        assert_eq!(
+            s.total_bytes(),
+            1 + KEY_OVERHEAD + charged_bytes(1, 1),
+            "the expired entry released every byte it was charged"
+        );
+        assert!(s.total_bytes() < with_two);
         assert_eq!(s.ttl(0, b"missing"), -2);
         s.set(0, b"plain", b"v".to_vec()).expect("set");
         assert_eq!(s.ttl(0, b"plain"), -1);
@@ -900,6 +1214,36 @@ mod tests {
         assert_eq!(s.total_bytes(), 0);
     }
 
+    /// A lowered cap evicts immediately, and a raised one allocates nothing.
+    #[test]
+    fn set_caps_takes_effect_on_the_live_keyspace() {
+        let mut s = store(64, 1 << 20, 64);
+        for index in 0..20_u8 {
+            s.set(0, &[b'k', index], vec![b'v'; 8]).expect("set");
+        }
+        assert_eq!(s.live_keys(), 20);
+        let before = s.total_bytes();
+
+        s.set_caps(StoreCaps {
+            max_keys: 4,
+            max_bytes: before / 4,
+            max_value_bytes: 8,
+            max_collection_len: 8,
+            max_ttl: Duration::from_secs(60),
+        });
+        assert!(s.live_keys() <= 4, "the key cap must apply at once");
+        assert!(
+            s.total_bytes() <= before / 4,
+            "the byte cap must apply at once"
+        );
+
+        // Raising the caps never invents data.
+        let after = s.total_bytes();
+        s.set_caps(StoreCaps::default());
+        assert_eq!(s.total_bytes(), after);
+        assert!(s.live_keys() > 0);
+    }
+
     #[test]
     fn virtual_config_never_leaves_the_store() {
         let mut s = store(8, 4_096, 64);
@@ -911,5 +1255,334 @@ mod tests {
             s.config_get(b"dir").first().map(|(_, v)| v.as_str()),
             Some("/tmp/evil")
         );
+    }
+
+    // --------------------------------------------------- resource model (regr.)
+
+    /// The headline bug: empty strings used to cost zero payload bytes, so a
+    /// list could be grown until the process died. Now every element is charged
+    /// its bookkeeping and the element count has a hard cap.
+    #[test]
+    fn empty_string_list_cannot_grow_past_the_element_cap() {
+        let mut s = store_with_elements(8);
+        let empties: Vec<Vec<u8>> = vec![Vec::new(); 8];
+        assert_eq!(s.list_push(0, b"flood", &empties, false).expect("push"), 8);
+
+        let before = s.total_bytes();
+        assert_eq!(
+            before,
+            empty_list_charge(b"flood", 8),
+            "eight empty elements must still be charged"
+        );
+        assert!(before > 0, "an empty-element list cannot be free");
+
+        let err = s
+            .list_push(0, b"flood", &[Vec::new()], false)
+            .expect_err("the element cap must refuse the ninth element");
+        assert_eq!(err, StoreError::TooManyElements { count: 9, max: 8 });
+        // The refusal changed nothing.
+        assert_eq!(s.total_bytes(), before);
+        assert_eq!(
+            s.list_range(0, b"flood", 0, -1).expect("range").len(),
+            8,
+            "a refused push must not truncate the list"
+        );
+    }
+
+    /// Repeated identical empty elements are separate elements in a list: the
+    /// charge has to move with the count, not with the (zero) payload.
+    #[test]
+    fn repeated_empty_elements_are_charged_each_time() {
+        let mut s = store_with_elements(64);
+        let mut last = 0;
+        for expected in 1..=16_usize {
+            let len = s
+                .list_push(0, b"dup", &[Vec::new()], true)
+                .expect("push empty");
+            assert_eq!(len, expected);
+            let now = s.total_bytes();
+            assert_eq!(now, empty_list_charge(b"dup", expected));
+            assert!(now > last, "the charge must grow with the element count");
+            last = now;
+        }
+        // LPUSH order: each new element goes to the head.
+        let items = s.list_range(0, b"dup", 0, -1).expect("range");
+        assert_eq!(items.len(), 16);
+        assert!(items.iter().all(Vec::is_empty));
+    }
+
+    /// A collection refused for its element count leaves the previous value and
+    /// its TTL untouched — the write is atomic.
+    #[test]
+    fn refused_collection_writes_roll_back_completely() {
+        let mut s = store_with_elements(4);
+        s.set_ex(0, b"k", b"v".to_vec(), Some(Duration::from_secs(3_600)))
+            .expect("set");
+        let before_bytes = s.total_bytes();
+        let before_ttl = s.ttl(0, b"k");
+
+        // Wrong type first: adding to a string must not touch the store.
+        let err = s
+            .list_push(0, b"k", &[Vec::new()], false)
+            .expect_err("a string is not a list");
+        assert_eq!(err, StoreError::WrongType);
+        assert_eq!(s.total_bytes(), before_bytes);
+        assert_eq!(s.ttl(0, b"k"), before_ttl);
+        assert_eq!(s.get(0, b"k").expect("get"), Some(b"v".to_vec()));
+
+        // Then an element-cap refusal on a real list, which must keep its TTL.
+        s.list_push(0, b"l", &[b"a".to_vec(), b"b".to_vec()], false)
+            .expect("push");
+        s.expire(0, b"l", Duration::from_secs(600));
+        let bytes = s.total_bytes();
+        let too_many = vec![b"c".to_vec(); 4];
+        let err = s
+            .list_push(0, b"l", &too_many, false)
+            .expect_err("over the element cap");
+        assert!(matches!(err, StoreError::TooManyElements { .. }));
+        assert_eq!(s.total_bytes(), bytes);
+        assert_eq!(s.ttl(0, b"l"), 600, "the TTL survived the refused write");
+        assert_eq!(s.list_range(0, b"l", 0, -1).expect("range").len(), 2);
+    }
+
+    /// One huge key is refused by the per-value cap; the store keeps its bytes.
+    #[test]
+    fn single_huge_key_is_refused_and_nothing_else_is_evicted() {
+        let mut s = store(8, 1 << 20, 64);
+        s.set(0, b"small", b"v".to_vec()).expect("set");
+        let before = s.total_bytes();
+        let err = s
+            .set(0, b"huge", vec![b'x'; 65])
+            .expect_err("over the per-value cap");
+        assert_eq!(err, StoreError::ValueTooLarge { size: 65, max: 64 });
+        assert_eq!(s.total_bytes(), before, "a refused write evicts nothing");
+        assert_eq!(s.live_keys(), 1);
+    }
+
+    /// Overwriting the same key a thousand times must not leak charge: the
+    /// accounting is a function of the contents, not of the write count.
+    #[test]
+    fn repeated_overwrites_do_not_leak_charge() {
+        let mut s = store(16, 1 << 20, 4_096);
+        s.set(0, b"k", vec![b'a'; 100]).expect("set");
+        let single = s.total_bytes();
+        for round in 0..1_000_u32 {
+            let payload = vec![b'a'; 100 + (round as usize % 7)];
+            s.set(0, b"k", payload).expect("overwrite");
+        }
+        s.set(0, b"k", vec![b'a'; 100]).expect("set");
+        assert_eq!(s.total_bytes(), single);
+        assert_eq!(s.live_keys(), 1);
+    }
+
+    /// `store_max_bytes` is the real bound: pushing many lists cannot exceed it,
+    /// and the store keeps answering by evicting rather than failing.
+    #[test]
+    fn total_bytes_never_exceeds_the_budget() {
+        let mut s = VirtualStore::new(StoreCaps {
+            max_keys: 1_000,
+            max_bytes: 16 * 1_024,
+            max_value_bytes: 4_096,
+            max_collection_len: 128,
+            max_ttl: Duration::from_secs(3_600),
+        });
+        let empties = vec![Vec::new(); 8];
+        for index in 0..500_u32 {
+            let key = format!("list:{index}").into_bytes();
+            let _ = s.list_push(0, &key, &empties, false);
+            assert!(
+                s.total_bytes() <= 16 * 1_024,
+                "charge {} exceeded the budget at key {index}",
+                s.total_bytes()
+            );
+        }
+        // Everything still answers.
+        assert!(s.live_keys() > 0);
+        assert!(s.db_size(0) > 0);
+    }
+
+    /// A value larger than the whole budget is refused before anything is
+    /// evicted, so an impossible write cannot wipe the keyspace.
+    #[test]
+    fn impossible_write_does_not_evict_the_store() {
+        let mut s = VirtualStore::new(StoreCaps {
+            max_keys: 32,
+            max_bytes: 1_024,
+            max_value_bytes: 1 << 20,
+            max_collection_len: 1 << 20,
+            max_ttl: Duration::from_secs(3_600),
+        });
+        s.set(0, b"keep", b"v".to_vec()).expect("set");
+        let err = s
+            .set(0, b"impossible", vec![b'x'; 2_048])
+            .expect_err("cannot ever fit");
+        assert!(matches!(err, StoreError::ValueTooLarge { .. }));
+        assert_eq!(s.get(0, b"keep").expect("get"), Some(b"v".to_vec()));
+    }
+
+    /// `LPUSH` keeps Redis order and stays linear: a thousand elements are
+    /// pushed without the quadratic re-shift the old `insert(0, …)` caused.
+    #[test]
+    fn lpush_keeps_redis_order_and_scales() {
+        let mut s = VirtualStore::new(StoreCaps {
+            max_keys: 4,
+            max_bytes: 1 << 20,
+            max_value_bytes: 1 << 20,
+            max_collection_len: 2_000,
+            max_ttl: Duration::from_secs(3_600),
+        });
+        let started = Instant::now();
+        for index in 0..1_000_u32 {
+            let value = index.to_string().into_bytes();
+            s.list_push(0, b"q", &[value], true).expect("lpush");
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "1000 LPUSHes took {elapsed:?}; the list is still being re-shifted"
+        );
+        let items = s.list_range(0, b"q", 0, -1).expect("range");
+        assert_eq!(items.len(), 1_000);
+        assert_eq!(items[0], b"999".to_vec(), "LPUSH puts the newest first");
+        assert_eq!(items[999], b"0".to_vec());
+
+        // `LPUSH k a b c` leaves `c b a`.
+        let mut s2 = store_with_elements(8);
+        s2.list_push(
+            0,
+            b"multi",
+            &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            true,
+        )
+        .expect("push");
+        let items = s2.list_range(0, b"multi", 0, -1).expect("range");
+        assert_eq!(items, vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()]);
+    }
+
+    /// Sets and hashes charge their members and refuse at the same cap, and a
+    /// replaced hash field only moves the payload delta.
+    #[test]
+    fn set_and_hash_element_accounting() {
+        let mut s = store_with_elements(4);
+        // A set of four empty strings is one member, exactly like real Redis:
+        // deduplication comes before charging, not after.
+        let empties = vec![Vec::new(); 4];
+        assert_eq!(s.set_add(0, b"s", &empties).expect("sadd"), 1);
+        assert_eq!(
+            s.total_bytes(),
+            b"s".len() + KEY_OVERHEAD + charged_bytes(0, 1)
+        );
+
+        let distinct = [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
+        assert_eq!(s.set_add(0, b"s", &distinct).expect("sadd"), 3);
+        assert_eq!(
+            s.total_bytes(),
+            b"s".len() + KEY_OVERHEAD + charged_bytes(3, 4)
+        );
+        // Duplicates are neither counted nor charged a second time.
+        let dup = vec![Vec::new(); 2];
+        let added = s.set_add(0, b"s", &dup).expect("dup sadd");
+        assert_eq!(added, 0);
+        let err = s
+            .set_add(0, b"s", &[b"d".to_vec()])
+            .expect_err("over the element cap");
+        assert_eq!(err, StoreError::TooManyElements { count: 5, max: 4 });
+
+        let mut h = store_with_elements(4);
+        h.hash_set(0, b"h", &[(b"f".to_vec(), Vec::new())])
+            .expect("hset");
+        let after_new = h.total_bytes();
+        assert_eq!(after_new, b"h".len() + KEY_OVERHEAD + charged_bytes(1, 1));
+        // Replacing an existing field with a same-size value changes nothing.
+        h.hash_set(0, b"h", &[(b"f".to_vec(), Vec::new())])
+            .expect("hset again");
+        assert_eq!(h.total_bytes(), after_new);
+        for index in 0..3_u32 {
+            h.hash_set(0, b"h", &[(format!("g{index}").into_bytes(), Vec::new())])
+                .expect("hset");
+        }
+        let err = h
+            .hash_set(0, b"h", &[(b"full".to_vec(), Vec::new())])
+            .expect_err("over the element cap");
+        assert_eq!(err, StoreError::TooManyElements { count: 5, max: 4 });
+    }
+
+    /// Reads and writes from several threads keep the accounting consistent:
+    /// the store is behind a `Mutex`, and a panicking or racing reader must not
+    /// be able to leave `total_bytes` describing a different keyspace.
+    #[test]
+    fn concurrent_readers_and_writers_keep_the_accounting_consistent() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        let store = Arc::new(Mutex::new(VirtualStore::new(StoreCaps {
+            max_keys: 64,
+            max_bytes: 64 * 1_024,
+            max_value_bytes: 4_096,
+            max_collection_len: 64,
+            max_ttl: Duration::from_secs(3_600),
+        })));
+
+        let mut threads = Vec::new();
+        for worker in 0..4_u8 {
+            let store = Arc::clone(&store);
+            threads.push(std::thread::spawn(move || {
+                for index in 0..250_u32 {
+                    let key = format!("w{worker}:{index}").into_bytes();
+                    let mut guard = store.lock().expect("lock");
+                    match index % 4 {
+                        0 => {
+                            let _ = guard.set(0, &key, vec![b'v'; 32]);
+                        }
+                        1 => {
+                            let empties = vec![Vec::new(); 2];
+                            let _ = guard.list_push(0, &key, &empties, false);
+                        }
+                        2 => {
+                            let _ = guard.set_add(0, &key, &[b"a".to_vec()]);
+                        }
+                        _ => {
+                            let _ = guard.hash_set(0, &key, &[(b"f".to_vec(), b"v".to_vec())]);
+                        }
+                    }
+                    // Reading back must not panic and must never observe a
+                    // charge above the configured budget.
+                    assert!(guard.total_bytes() <= 64 * 1_024);
+                    let _ = guard.get(0, &key);
+                    let _ = guard.live_keys();
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("worker thread");
+        }
+
+        let mut guard = store.lock().expect("lock");
+        // Recompute the charge from scratch and compare it with the running
+        // total: they may only differ if the accounting drifted.
+        let recomputed: usize = guard
+            .entries
+            .iter()
+            .map(|((_, key), entry)| charged_entry_bytes(key.len(), &entry.value))
+            .fold(0_usize, usize::saturating_add);
+        assert_eq!(guard.total_bytes, recomputed);
+        guard.flush_all();
+        assert_eq!(guard.total_bytes(), 0);
+    }
+
+    /// `set` after a long list keeps the list's charge, not the string's.
+    #[test]
+    fn replacing_a_collection_with_a_string_releases_its_charge() {
+        let mut s = store_with_elements(32);
+        let empties = vec![Vec::new(); 32];
+        s.list_push(0, b"k", &empties, false).expect("push");
+        let big = s.total_bytes();
+        s.set(0, b"k", b"v".to_vec()).expect("set");
+        assert!(s.total_bytes() < big);
+        assert_eq!(
+            s.total_bytes(),
+            b"k".len() + KEY_OVERHEAD + charged_bytes(1, 1)
+        );
+        assert_eq!(s.type_of(0, b"k"), "string");
     }
 }

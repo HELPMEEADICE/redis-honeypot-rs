@@ -5,6 +5,7 @@
 
 mod support;
 
+use redis_honeypot_rs::config::Config;
 use support::{Harness, bulk, count, encode_cmd, expect_error, line, type_byte};
 
 #[tokio::test]
@@ -202,6 +203,41 @@ async fn binary_safe_values_survive_a_roundtrip() {
     let got = bulk(&c.call(&[b"GET", b"bin"]).await).expect("bulk reply");
     assert_eq!(got, value, "binary value must round-trip byte for byte");
 
+    server.stop().await;
+}
+
+/// A reply is built in full before it is written, so its length is the
+/// per-connection peak. With a deliberately tiny budget the honeypot refuses to
+/// build an oversized reply instead of allocating it.
+#[tokio::test]
+async fn oversized_reply_is_refused_by_the_reply_cap() {
+    let mut cfg = Config::default();
+    cfg.limits.max_message_bytes = 256;
+    cfg.limits.max_bulk_len = 256;
+    cfg.limits.store_max_bytes = 256;
+    cfg.limits.store_max_value_bytes = 256;
+    cfg.limits.store_max_collection_len = 8;
+    // The preview cap may not exceed `max_bulk_len`, so it shrinks with it.
+    cfg.limits.max_stored_param_bytes = 256;
+    cfg.validate().expect("the tiny limits are still valid");
+
+    let server = Harness::start_with(cfg).await;
+    let mut c = server.connect().await;
+
+    // Small replies go through untouched.
+    assert_eq!(c.call(&[b"PING"]).await, b"+PONG\r\n");
+    assert!(bulk(&c.call(&[b"GET", b"absent"]).await).is_none());
+
+    // `COMMAND` answers with the whole command table, which cannot fit in
+    // `max_message_bytes + store_max_bytes`.
+    let err = expect_error(&c.call(&[b"COMMAND"]).await);
+    assert!(
+        err.contains("reply exceeds"),
+        "expected the reply cap, got {err:?}"
+    );
+
+    // A refused reply is not a closed connection: the session keeps working.
+    assert_eq!(c.call(&[b"PING"]).await, b"+PONG\r\n");
     server.stop().await;
 }
 

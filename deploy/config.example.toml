@@ -36,18 +36,36 @@ max_commands_per_conn = 1024
 max_auth_attempts = 64
 idle_timeout_secs = 1800
 partial_frame_timeout_secs = 30
+
+# 单条命令预览写入 SQLite 的字节上限（commands.args / auth_attempts.meta /
+# security_events.detail 共用）。它同时被网络层和数据库写入层读取，两边不会再
+# 出现 2048 常量与配置不一致的情况。上限必须 <= 65536 且 <= max_bulk_len。
 max_stored_param_bytes = 2048
+
+# ---- 虚拟键空间（内存预算）------------------------------------------------
+# 攻击者能写的内存由这三项共同约束，任何一项超限都返回 Redis 协议错误，
+# 不会 panic，也不会无界增长：
+#   store_max_keys       键的总数
+#   store_max_bytes      所有键的"计费字节"总和（载荷 + 每元素 32B 元数据 +
+#                        每键 64B 元数据），是真实堆内存的保守下界
+#   store_max_value_bytes 单个键的逻辑载荷上限
 store_max_keys = 1024
 store_max_bytes = 1048576
 store_max_value_bytes = 4096
+# 单个 list/set/hash 的元素个数上限（空字符串元素也计入，避免零载荷放大）。
+store_max_collection_len = 256
 store_max_ttl_secs = 86400
 
 [database]
 path = "./redis-honeypot.db"
+# 软容量上限，语义是"数据实际占用的页"(page_count - freelist_count)，
+# 而不是文件大小：DELETE 不会缩小文件，靠 incremental_vacuum 回收空页。
 max_bytes = 268435456
 queue_capacity = 8192
 batch_size = 128
 batch_interval_ms = 250
 retention_days = 30
 checkpoint_interval_secs = 300
+# 维护（按时间节拍驱动，与是否有新攻击流量无关）：即使长时间没有流量，
+# 也会执行过期清理、容量回收和 WAL checkpoint。
 maintenance_interval_secs = 60

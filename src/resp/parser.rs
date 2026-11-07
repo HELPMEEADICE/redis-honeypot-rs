@@ -897,6 +897,41 @@ mod tests {
     }
 
     #[test]
+    fn long_pipeline_of_big_values_decodes_in_eight_kilo_byte_chunks() {
+        // Reproduces the wire shape a real flood produced: 1.5 MB of 5 KB SETs,
+        // with keys long enough that `$2\r\nk10` would be a protocol error.
+        let mut wire = Vec::new();
+        for index in 0..300_u32 {
+            let value = vec![b'x'; 5_000];
+            let key = format!("k{index}");
+            wire.extend_from_slice(
+                format!(
+                    "*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n${}\r\n",
+                    key.len(),
+                    value.len()
+                )
+                .as_bytes(),
+            );
+            wire.extend_from_slice(&value);
+            wire.extend_from_slice(b"\r\n");
+        }
+        // Same caps the honeypot ships with: 512 KiB messages, 512 KiB bulks.
+        let mut decoder = RespDecoder::new(512 * 1_024, 512 * 1_024, 1_024, 8);
+        let mut frames = 0_usize;
+        for chunk in wire.chunks(8 * 1_024) {
+            decoder.extend(chunk).expect("extend");
+            loop {
+                match decoder.try_decode() {
+                    Ok(Some(_)) => frames += 1,
+                    Ok(None) => break,
+                    Err(err) => panic!("decode failed after {frames} frames: {err:?}"),
+                }
+            }
+        }
+        assert_eq!(frames, 300);
+    }
+
+    #[test]
     fn oversized_stream_is_rejected_before_the_buffer_grows() {
         let mut decoder = RespDecoder::new(256, 256, 8, 4);
         let mut error = None;

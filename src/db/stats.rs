@@ -44,6 +44,10 @@ const SQL_DANGEROUS_ROWS: &str = "SELECT ts, ip, name, args, risk_label FROM com
      WHERE risk >= 3 ORDER BY ts DESC, id DESC LIMIT ?1";
 
 /// Lowest and highest timestamp seen by any table, as Unix milliseconds.
+/// The writer's own counters, if this database was ever written by a version
+/// that records them. A missing table (version 1 database) is not an error.
+const SQL_WRITER_STATS: &str =
+    "SELECT updated_at, lost, retried, retry_failed, pruned_rows FROM writer_stats WHERE id = 1";
 const SQL_WINDOW: &str = "SELECT min(t), max(t) FROM (
         SELECT min(ts) AS t FROM commands UNION ALL SELECT max(ts) FROM commands
         UNION ALL SELECT min(ts) FROM auth_attempts UNION ALL SELECT max(ts) FROM auth_attempts
@@ -241,9 +245,55 @@ fn summary(conn: &Connection) -> Result<Vec<(String, String)>, DbError> {
             scalar(conn, SQL_DANGEROUS_TOTAL)?.to_string(),
         ),
         ("db.size_bytes".to_owned(), size.to_string()),
+        ("db.used_bytes".to_owned(), used_bytes(conn).to_string()),
         ("window.oldest".to_owned(), stamp(oldest)),
         ("window.newest".to_owned(), stamp(newest)),
-    ])
+    ]
+    .into_iter()
+    .chain(writer_health(conn))
+    .collect())
+}
+
+/// Pages the data actually occupies, the same unit `database.max_bytes` bounds.
+fn used_bytes(conn: &Connection) -> i64 {
+    let pages = conn
+        .query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))
+        .unwrap_or(0)
+        .saturating_sub(
+            conn.query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))
+                .unwrap_or(0),
+        );
+    let size = conn
+        .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))
+        .unwrap_or(0);
+    pages.saturating_mul(size)
+}
+
+/// The writer's health, as of the last time it flushed its counters.
+///
+/// Absent on a database written by an older version, and on one that was never
+/// written at all: then there is nothing to report and the section is skipped
+/// rather than printing a misleading zero.
+fn writer_health(conn: &Connection) -> Vec<(String, String)> {
+    let row = conn.query_row(SQL_WRITER_STATS, [], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    });
+    let Ok((updated, lost, retried, retry_failed, pruned)) = row else {
+        return Vec::new();
+    };
+    vec![
+        ("writer.lost".to_owned(), lost.to_string()),
+        ("writer.retried".to_owned(), retried.to_string()),
+        ("writer.retry_failed".to_owned(), retry_failed.to_string()),
+        ("writer.pruned_rows".to_owned(), pruned.to_string()),
+        ("writer.updated_at".to_owned(), stamp(Some(updated))),
+    ]
 }
 
 /// One count. Every query in this module returns a single integer column.
@@ -361,6 +411,65 @@ mod tests {
     use crate::db::testutil::{Reader, TempDb, auth, closed, command, opened, security};
     use crate::record::{CloseReason, RiskLevel, SecurityKind};
 
+    /// The writer's own health survives the process that produced it: the row is
+    /// written on the maintenance tick and a later `stats` run reports it.
+    #[tokio::test]
+    async fn writer_health_is_persisted_and_reported() {
+        let tmp = TempDb::create();
+        let mut cfg = tmp.config();
+        cfg.maintenance_interval_secs = 1;
+        let handle = crate::db::spawn_writer(&cfg, &crate::config::Limits::default())
+            .expect("writer starts");
+        let recorder = handle.recorder.clone();
+        let at = SystemTime::now();
+        for index in 0..3_u64 {
+            let _ = recorder.emit(command(
+                1,
+                "198.51.100.23",
+                at,
+                "PING",
+                &format!("w{index}"),
+                RiskLevel::None,
+            ));
+        }
+
+        // The tick writes the counters, not only the shutdown path.
+        let reader = Reader::open(&tmp.path).expect("reader");
+        let rows = reader.wait_for("SELECT count(*) FROM writer_stats", 1, 15_000);
+        assert_eq!(rows, 1, "the writer never persisted its counters");
+        drop(reader);
+
+        drop(recorder);
+        handle.shutdown().await;
+
+        // A separate process (`stats`) reads them back from the same file.
+        let report = collect(&tmp.path, &full_query()).expect("stats report");
+        let lookup = |key: &str| {
+            report
+                .summary
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+        for key in [
+            "writer.lost",
+            "writer.retried",
+            "writer.retry_failed",
+            "writer.pruned_rows",
+            "writer.updated_at",
+            "db.used_bytes",
+        ] {
+            assert!(lookup(key).is_some(), "summary is missing {key}");
+        }
+        assert_eq!(lookup("writer.lost").as_deref(), Some("0"));
+        assert_eq!(lookup("writer.retry_failed").as_deref(), Some("0"));
+        // `db.used_bytes` can never exceed the file size it lives in.
+        let size: i64 = lookup("db.size_bytes").expect("size").parse().expect("i64");
+        let used: i64 = lookup("db.used_bytes").expect("used").parse().expect("i64");
+        assert!(used <= size, "used {used} > file {size}");
+        assert!(used > 0, "a database with rows must have used pages");
+    }
+
     fn full_query() -> StatsQuery {
         StatsQuery {
             top_ips: 10,
@@ -383,7 +492,8 @@ mod tests {
     #[tokio::test]
     async fn collect_reports_known_rows() {
         let tmp = TempDb::create();
-        let handle = crate::db::spawn_writer(&tmp.config()).expect("writer starts");
+        let handle = crate::db::spawn_writer(&tmp.config(), &crate::config::Limits::default())
+            .expect("writer starts");
         let recorder = handle.recorder.clone();
         let at = SystemTime::now();
 
@@ -448,8 +558,15 @@ mod tests {
                 "security.events",
                 "dangerous.commands",
                 "db.size_bytes",
+                "db.used_bytes",
                 "window.oldest",
                 "window.newest",
+                // A writer did touch this file, so its health block is present.
+                "writer.lost",
+                "writer.retried",
+                "writer.retry_failed",
+                "writer.pruned_rows",
+                "writer.updated_at",
             ],
             "summary keys and their order are part of the contract"
         );
@@ -525,7 +642,17 @@ mod tests {
         drop(crate::db::init_db(&tmp.path).expect("init"));
 
         let report = collect(&tmp.path, &full_query()).expect("collect");
-        assert_eq!(report.summary.len(), 11);
+        // The 12 fixed keys; the writer health block is absent because no writer
+        // ever touched this file, and a misleading zero would be worse than no
+        // line at all.
+        assert_eq!(report.summary.len(), 12);
+        assert!(
+            report
+                .summary
+                .iter()
+                .all(|(key, _)| !key.starts_with("writer.")),
+            "a database no writer has touched must not report writer health"
+        );
         assert_eq!(summary_value(&report, "connections.total"), "0");
         assert_eq!(summary_value(&report, "commands.total"), "0");
         assert_eq!(summary_value(&report, "window.oldest"), EMPTY);
@@ -554,7 +681,8 @@ mod tests {
     #[tokio::test]
     async fn zero_limits_skip_the_leaderboards() {
         let tmp = TempDb::create();
-        let handle = crate::db::spawn_writer(&tmp.config()).expect("writer starts");
+        let handle = crate::db::spawn_writer(&tmp.config(), &crate::config::Limits::default())
+            .expect("writer starts");
         let recorder = handle.recorder.clone();
         let _ = recorder.emit(command(
             1,
@@ -601,7 +729,8 @@ mod tests {
     #[tokio::test]
     async fn dangerous_rows_shorten_args_for_display() {
         let tmp = TempDb::create();
-        let handle = crate::db::spawn_writer(&tmp.config()).expect("writer starts");
+        let handle = crate::db::spawn_writer(&tmp.config(), &crate::config::Limits::default())
+            .expect("writer starts");
         let recorder = handle.recorder.clone();
         let long = "A".repeat(1_000);
         let _ = recorder.emit(command(

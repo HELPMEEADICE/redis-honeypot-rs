@@ -6,7 +6,8 @@
 //!   channel ([`crate::record::Recorder`]).
 //! * One writer task owns the connection, batches records into transactions and
 //!   performs retention/size maintenance and WAL checkpoints.
-//! * A database failure is logged and retried, never propagated to the listener.
+//! * A database failure is retried within a budget, counted when it is finally
+//!   lost, and never propagated to the listener.
 
 pub mod schema;
 pub mod stats;
@@ -21,9 +22,20 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::config::Database as DatabaseConfig;
+use crate::config::Limits;
 use crate::record::Recorder;
 
 pub use stats::StatsQuery;
+pub use writer::WriterStats;
+
+/// Largest database that is rewritten (`VACUUM`) on startup so `auto_vacuum`
+/// can be switched to `INCREMENTAL`.
+///
+/// `auto_vacuum` can only be turned on for a database that has no pages yet, or
+/// by rewriting the whole file. Rewriting an arbitrary database at startup would
+/// be an unbounded pause, so the migration is bounded by size and simply logged
+/// as skipped above the threshold.
+const AUTO_VACUUM_MIGRATION_MAX_BYTES: i64 = 64 * 1024 * 1024;
 
 /// Persistence failure. Never fatal to the network service.
 #[derive(Debug)]
@@ -76,9 +88,63 @@ pub fn open(path: &Path) -> Result<Connection, DbError> {
     Ok(conn)
 }
 
+/// Switch the database to `PRAGMA auto_vacuum = INCREMENTAL` where possible.
+///
+/// Returns whether the database now uses incremental auto-vacuum.
+///
+/// The pragma only takes effect on a database that has no pages yet, or after a
+/// `VACUUM` rewrites the file, so this is deliberately best effort:
+///
+/// * already `INCREMENTAL` → nothing to do (the common case after the first
+///   start);
+/// * empty file → set it, it applies to the first write;
+/// * existing file inside [`AUTO_VACUUM_MIGRATION_MAX_BYTES`] → set it and
+///   rewrite once, which is bounded in time;
+/// * existing file above the threshold → leave it alone and say so. The size cap
+///   still works (it measures used pages), only the file cannot shrink on its
+///   own; the operator can `VACUUM` manually.
+fn ensure_incremental_auto_vacuum(conn: &Connection) -> Result<bool, DbError> {
+    let mode: i64 = conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+    if mode == writer::AUTO_VACUUM_INCREMENTAL {
+        return Ok(true);
+    }
+    let pages: i64 = conn.pragma_query_value(None, "page_count", |row| row.get(0))?;
+    if pages == 0 {
+        // Nothing has been written yet: the pragma applies to the first page.
+        conn.pragma_update(None, "auto_vacuum", writer::AUTO_VACUUM_INCREMENTAL)?;
+        return Ok(true);
+    }
+    let page_size: i64 = conn.pragma_query_value(None, "page_size", |row| row.get(0))?;
+    let size = pages.saturating_mul(page_size);
+    if size > AUTO_VACUUM_MIGRATION_MAX_BYTES {
+        tracing::warn!(
+            size,
+            limit = AUTO_VACUUM_MIGRATION_MAX_BYTES,
+            "database is too large to enable incremental auto-vacuum at startup; \
+             free pages will not be returned to the filesystem until it is VACUUMed"
+        );
+        return Ok(false);
+    }
+    // Setting the pragma is what changes the mode; the VACUUM is what makes it
+    // apply to an existing file.
+    conn.pragma_update(None, "auto_vacuum", writer::AUTO_VACUUM_INCREMENTAL)?;
+    conn.execute_batch("VACUUM")?;
+    let mode: i64 = conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+    let migrated = mode == writer::AUTO_VACUUM_INCREMENTAL;
+    if migrated {
+        tracing::info!(size, "migrated the database to incremental auto-vacuum");
+    } else {
+        tracing::warn!(mode, "incremental auto-vacuum could not be enabled");
+    }
+    Ok(migrated)
+}
+
 /// Open (creating if needed) and make sure the schema exists.
 pub fn init_db(path: &Path) -> Result<Connection, DbError> {
     let conn = open(path)?;
+    // Order matters: the pragma has to be set before the first table exists for
+    // a brand new database, and before the VACUUM for an existing one.
+    ensure_incremental_auto_vacuum(&conn)?;
     schema::init(&conn)?;
     conn.pragma_update(None, "user_version", schema::SCHEMA_VERSION)?;
     Ok(conn)
@@ -88,12 +154,17 @@ pub fn init_db(path: &Path) -> Result<Connection, DbError> {
 pub struct DbHandle {
     /// Clone this into the network layer.
     pub recorder: Recorder,
+    stats: Arc<WriterStats>,
     join: JoinHandle<()>,
 }
 
 impl DbHandle {
-    pub fn new(recorder: Recorder, join: JoinHandle<()>) -> Self {
-        Self { recorder, join }
+    pub fn new(recorder: Recorder, stats: Arc<WriterStats>, join: JoinHandle<()>) -> Self {
+        Self {
+            recorder,
+            stats,
+            join,
+        }
     }
 
     /// Number of telemetry records dropped so far (queue full or closed).
@@ -101,17 +172,33 @@ impl DbHandle {
         self.recorder.dropped()
     }
 
+    /// Number of records lost because SQLite rejected them even after retrying.
+    pub fn lost(&self) -> u64 {
+        self.stats.lost()
+    }
+
+    /// Writer-side counters, for the periodic watchdog line.
+    pub fn writer_stats(&self) -> Arc<WriterStats> {
+        self.stats.clone()
+    }
+
     /// Close the channel, flush what is queued, and wait for the writer.
     ///
     /// Bounded so shutdown cannot hang on a wedged disk.
     pub async fn shutdown(self) {
-        let Self { recorder, join } = self;
+        let Self {
+            recorder,
+            stats,
+            join,
+        } = self;
         drop(recorder);
         if tokio::time::timeout(Duration::from_secs(5), join)
             .await
             .is_err()
         {
             tracing::warn!("sqlite writer did not stop within 5s; detaching");
+        } else if stats.lost() > 0 {
+            tracing::warn!(lost = stats.lost(), "sqlite writer lost records in total");
         }
     }
 }
@@ -120,9 +207,13 @@ impl DbHandle {
 ///
 /// This is the only fatal database path: if the file cannot be opened or the
 /// schema cannot be created, `main` must fail at startup instead of running a
-/// honeypot that silently records nothing. Every *later* failure is logged and
-/// survived inside [`writer::run`].
-pub fn spawn_writer(cfg: &DatabaseConfig) -> Result<DbHandle, DbError> {
+/// honeypot that silently records nothing. Every *later* failure is retried,
+/// counted and survived inside [`writer::run`].
+///
+/// `limits` is passed in so the stored-argument cap
+/// ([`Limits::max_stored_param_bytes`]) travels with the writer instead of being
+/// duplicated as a constant it can drift away from.
+pub fn spawn_writer(cfg: &DatabaseConfig, limits: &Limits) -> Result<DbHandle, DbError> {
     let runtime = tokio::runtime::Handle::try_current()
         .map_err(|err| DbError::Spawn(format!("the sqlite writer needs a tokio runtime: {err}")))?;
 
@@ -134,9 +225,11 @@ pub fn spawn_writer(cfg: &DatabaseConfig) -> Result<DbHandle, DbError> {
     let dropped = Arc::new(crate::record::DropCounter::new(0));
     let recorder = Recorder::new(tx, dropped);
 
-    let tuning = writer::Tuning::from_config(cfg);
-    let join = runtime.spawn_blocking(move || writer::run(conn, rx, tuning));
-    Ok(DbHandle::new(recorder, join))
+    let tuning = writer::Tuning::from_config(cfg, limits.max_stored_param_bytes);
+    let stats = Arc::new(WriterStats::default());
+    let writer_stats = stats.clone();
+    let join = runtime.spawn_blocking(move || writer::run(conn, rx, tuning, writer_stats));
+    Ok(DbHandle::new(recorder, stats, join))
 }
 
 /// Fixtures for the `db` tests: unique temp files, record builders, a reader.
@@ -200,18 +293,44 @@ pub(crate) mod testutil {
     /// A second connection, used to observe what the writer committed.
     pub(crate) struct Reader {
         conn: Connection,
+        path: PathBuf,
     }
 
     impl Reader {
         pub(crate) fn open(path: &Path) -> Result<Self, DbError> {
             Ok(Self {
                 conn: super::open(path)?,
+                path: path.to_path_buf(),
             })
         }
 
         /// First column of the first row of `sql`.
         pub(crate) fn value<T: FromSql>(&self, sql: &str) -> Result<T, DbError> {
             Ok(self.conn.query_row(sql, [], |row| row.get::<_, T>(0))?)
+        }
+
+        /// An integer pragma of the observed database.
+        pub(crate) fn pragma(&self, name: &str) -> i64 {
+            self.conn
+                .pragma_query_value(None, name, |row| row.get::<_, i64>(0))
+                .unwrap_or(-1)
+        }
+
+        /// Pages the data actually occupies, in bytes: `(page_count - freelist)`.
+        pub(crate) fn used_bytes(&self) -> i64 {
+            let pages = self
+                .pragma("page_count")
+                .saturating_sub(self.pragma("freelist_count"));
+            pages.saturating_mul(self.pragma("page_size"))
+        }
+
+        /// The `-wal` sidecar size, which is what a checkpoint is meant to shrink.
+        pub(crate) fn wal_bytes(&self) -> u64 {
+            let mut raw = self.path.as_os_str().to_owned();
+            raw.push("-wal");
+            std::fs::metadata(PathBuf::from(raw))
+                .map(|meta| meta.len())
+                .unwrap_or(0)
         }
 
         /// Poll `sql` until it returns `want` or `timeout_ms` expires; the last
@@ -349,7 +468,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let handle = runtime.block_on(async { spawn_writer(&tmp.config()) });
+        let handle = runtime.block_on(async { spawn_writer(&tmp.config(), &Limits::default()) });
         assert!(handle.is_ok(), "writer must create the file");
         assert!(tmp.path.exists());
     }
@@ -358,7 +477,7 @@ mod tests {
     #[test]
     fn spawn_writer_without_runtime_is_an_error() {
         let tmp = TempDb::create();
-        match spawn_writer(&tmp.config()) {
+        match spawn_writer(&tmp.config(), &Limits::default()) {
             Err(DbError::Spawn(message)) => assert!(!message.is_empty()),
             Err(other) => panic!("unexpected error: {other}"),
             Ok(_) => panic!("a runtime is required"),

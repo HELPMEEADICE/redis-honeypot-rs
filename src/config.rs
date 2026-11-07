@@ -8,6 +8,19 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Hard ceiling for [`Limits::max_stored_param_bytes`] (64 KiB).
+///
+/// Larger previews buy no forensic value — the interesting part of a payload is
+/// at the front — while every queued record carries a copy of it.
+pub const MAX_STORED_PARAM_BYTES_CEILING: usize = 64 * 1024;
+
+/// Hard ceiling for [`Limits::store_max_collection_len`].
+///
+/// One million elements per key is far more than a simulated `LRANGE 0 -1`
+/// should ever have to encode, and keeps the per-key charge arithmetic far away
+/// from `usize` overflow on 32-bit targets.
+pub const MAX_COLLECTION_LEN_CEILING: usize = 1_048_576;
+
 /// Hard caps applied to everything an attacker can influence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -35,13 +48,22 @@ pub struct Limits {
     /// Slow-client timeout: a partial frame older than this closes the socket.
     pub partial_frame_timeout_secs: u64,
     /// Maximum bytes of one recorded argument preview (storage guard).
+    ///
+    /// This is the single authority for how much of one attacker supplied
+    /// argument reaches SQLite (`commands.args`, `auth_attempts.meta`,
+    /// `security_events.detail`). The writer is handed the value at startup, so
+    /// the network layer and the database layer can never disagree about it.
+    /// Per-column caps (IP, username, command name, …) stay smaller and are
+    /// applied *after* this one.
     pub max_stored_param_bytes: usize,
     /// Maximum keys in the virtual keyspace (all logical databases together).
     pub store_max_keys: usize,
     /// Maximum bytes stored in the virtual keyspace.
     pub store_max_bytes: usize,
-    /// Maximum size of a single virtual value.
+    /// Maximum size of a single virtual value (logical payload bytes).
     pub store_max_value_bytes: usize,
+    /// Maximum number of elements in one virtual list, set or hash.
+    pub store_max_collection_len: usize,
     /// Maximum simulated TTL in seconds.
     pub store_max_ttl_secs: u64,
 }
@@ -64,6 +86,7 @@ impl Default for Limits {
             store_max_keys: 1024,
             store_max_bytes: 1024 * 1024,
             store_max_value_bytes: 4096,
+            store_max_collection_len: 256,
             store_max_ttl_secs: 86_400,
         }
     }
@@ -99,7 +122,10 @@ impl Timing {
 }
 
 /// SQLite persistence knobs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` exists so a hot reload can tell the operator exactly which
+/// database knobs changed and therefore still need a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Database {
     /// Path to the SQLite file (created on demand).
@@ -245,6 +271,15 @@ impl Config {
                 "max_stored_param_bytes must be > 0".into(),
             ));
         }
+        // An unbounded preview cap would let one command reserve as much memory
+        // as the whole message: bound it by both numbers it interacts with.
+        if l.max_stored_param_bytes > MAX_STORED_PARAM_BYTES_CEILING
+            || l.max_stored_param_bytes > l.max_bulk_len
+        {
+            return Err(ConfigError::Invalid(format!(
+                "max_stored_param_bytes must be <= {MAX_STORED_PARAM_BYTES_CEILING} and <= max_bulk_len"
+            )));
+        }
         if l.store_max_keys == 0
             || l.store_max_bytes == 0
             || l.store_max_value_bytes == 0
@@ -253,6 +288,27 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "virtual store caps must be > 0 and store_max_value_bytes <= store_max_bytes"
                     .into(),
+            ));
+        }
+        // A single reply must be able to carry a whole key, framing included;
+        // beyond this the connection layer refuses to build it (see
+        // `connection::ConnCtx::reply`), so reject the config up front instead of
+        // surprising the operator at runtime.
+        if l.store_max_value_bytes > l.max_message_bytes {
+            return Err(ConfigError::Invalid(
+                "store_max_value_bytes must be <= max_message_bytes".into(),
+            ));
+        }
+        if l.store_max_collection_len == 0
+            || l.store_max_collection_len > MAX_COLLECTION_LEN_CEILING
+        {
+            return Err(ConfigError::Invalid(format!(
+                "store_max_collection_len must be in 1..={MAX_COLLECTION_LEN_CEILING}"
+            )));
+        }
+        if l.store_max_ttl_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "store_max_ttl_secs must be > 0".into(),
             ));
         }
 
@@ -340,6 +396,34 @@ mod tests {
         let mut cfg = Config::default();
         cfg.limits.max_depth = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    /// The two new hard ceilings: a preview cap above the ceiling (or above
+    /// `max_bulk_len`) and a zero/absurd collection cap are both refused, so a
+    /// config file cannot re-open the memory holes they close.
+    #[test]
+    fn store_and_preview_caps_are_validated() {
+        let mut cfg = Config::default();
+        cfg.limits.store_max_collection_len = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = Config::default();
+        cfg.limits.store_max_collection_len = MAX_COLLECTION_LEN_CEILING + 1;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = Config::default();
+        cfg.limits.max_stored_param_bytes = MAX_STORED_PARAM_BYTES_CEILING + 1;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = Config::default();
+        cfg.limits.max_stored_param_bytes = cfg.limits.max_bulk_len + 1;
+        assert!(cfg.validate().is_err());
+
+        // The defaults are inside every bound.
+        let cfg = Config::default();
+        cfg.validate().expect("defaults are valid");
+        assert_eq!(cfg.limits.store_max_collection_len, 256);
+        assert!(cfg.limits.max_stored_param_bytes <= MAX_STORED_PARAM_BYTES_CEILING);
     }
 
     #[test]

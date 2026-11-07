@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
@@ -88,10 +88,46 @@ pub(crate) async fn shutdown_signal(rx: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Broadcast of a reloaded configuration (SIGHUP).
+///
+/// The listener subscribes once and applies whatever is published; a value of
+/// `None` is the initial "nothing reloaded yet" state. A failed reload is never
+/// published, so a broken config file cannot take the running server down.
+#[derive(Debug, Clone)]
+pub struct ReloadHandle {
+    tx: watch::Sender<Option<Arc<Config>>>,
+}
+
+impl ReloadHandle {
+    pub fn new() -> Self {
+        let (tx, _rx) = watch::channel(None);
+        Self { tx }
+    }
+
+    /// Publish a new configuration. Returns whether a listener was listening.
+    pub fn apply(&self, config: Config) -> bool {
+        self.tx.send(Some(Arc::new(config))).is_ok()
+    }
+
+    fn subscribe(&self) -> watch::Receiver<Option<Arc<Config>>> {
+        self.tx.subscribe()
+    }
+}
+
+impl Default for ReloadHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// State shared by every connection task.
 #[derive(Debug)]
 pub struct SharedState {
-    pub config: Arc<Config>,
+    /// Swapped wholesale on SIGHUP. `RwLock` (not a bare `Arc`) so a running
+    /// connection cannot keep the older snapshot from being replaced; the lock
+    /// is taken once per connection, never per command, so the hot path is
+    /// unaffected.
+    config: RwLock<Arc<Config>>,
     pub recorder: Recorder,
     /// The virtual keyspace, shared so attackers observe each other's writes.
     pub store: Arc<Mutex<VirtualStore>>,
@@ -103,10 +139,97 @@ impl SharedState {
             &config.limits,
         ))));
         Self {
-            config,
+            config: RwLock::new(config),
             recorder,
             store,
         }
+    }
+
+    /// The configuration a *new* connection starts with.
+    pub fn config(&self) -> Arc<Config> {
+        match self.config.read() {
+            Ok(guard) => guard.clone(),
+            // A poisoned lock only means some reader panicked; the value itself
+            // is still a valid snapshot, and losing the listener over it would be
+            // strictly worse.
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn replace_config(&self, config: Arc<Config>) {
+        // Re-cap the shared keyspace first: a lowered budget must bite now, not
+        // at the next write, and doing it before the swap means a connection that
+        // already picked up the new config cannot observe the old caps.
+        let caps = StoreCaps::from_limits(&config.limits);
+        {
+            let mut store = match self.store.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            store.set_caps(caps);
+        }
+        match self.config.write() {
+            Ok(mut guard) => *guard = config,
+            Err(poisoned) => *poisoned.into_inner() = config,
+        }
+    }
+}
+
+/// Apply a reloaded configuration and say what still needs a restart.
+///
+/// Semantics, deliberately narrow and documented:
+/// * limits, parser caps and timing apply to **new** connections (a live
+///   connection keeps the snapshot it started with, so its replies stay
+///   self-consistent);
+/// * the virtual keyspace is re-capped **immediately**, evicting if the new
+///   budget is smaller;
+/// * the bind address, the IPv6 toggle, the admission caps and every database
+///   knob are fixed at startup — they are reported, never silently ignored.
+fn apply_reload(shared: &SharedState, config: Arc<Config>) {
+    let previous = shared.config();
+    let mut restart: Vec<&str> = Vec::new();
+    if previous.bind != config.bind {
+        restart.push("bind");
+    }
+    if previous.enable_ipv6 != config.enable_ipv6 {
+        restart.push("enable_ipv6");
+    }
+    if previous.limits.max_connections != config.limits.max_connections {
+        restart.push("limits.max_connections");
+    }
+    if previous.limits.max_connections_per_ip != config.limits.max_connections_per_ip {
+        restart.push("limits.max_connections_per_ip");
+    }
+    if previous.database != config.database {
+        restart.push("database.*");
+    }
+
+    let (min, max) = config.timing.auth_bounds();
+    let store = config.limits.store_max_bytes;
+    let per_key = config.limits.store_max_value_bytes;
+    shared.replace_config(config);
+
+    logging::info(&format!(
+        "configuration reloaded: auth window {min}-{max}ms, store {store} B ({per_key} B per key), new connections only"
+    ));
+    if !restart.is_empty() {
+        logging::warn(&format!(
+            "restart required for: {} (these values are fixed at startup)",
+            restart.join(", ")
+        ));
+    }
+}
+
+/// Resolve when a reload is published, or never when no handle was supplied.
+async fn reload_signal(rx: &mut Option<watch::Receiver<Option<Arc<Config>>>>) {
+    match rx {
+        Some(rx) => {
+            if rx.changed().await.is_err() {
+                // The sender is gone: stop waking up, never spin.
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -242,6 +365,7 @@ pub async fn serve(
     recorder: Recorder,
     shutdown: ShutdownHandle,
     ready: Option<oneshot::Sender<Vec<SocketAddr>>>,
+    reload: Option<ReloadHandle>,
 ) -> Result<ServerSummary, ServerError> {
     let limits = config.limits.clone();
     let config = Arc::new(config);
@@ -276,6 +400,35 @@ pub async fn serve(
 
     // --------------------------------------------------------- shared state
     let shared = Arc::new(SharedState::new(config.clone(), recorder.clone()));
+
+    // ------------------------------------------------------------ hot reload
+    // A tiny task listens for published configurations and swaps them into the
+    // shared state. It stops with the server, so a reload can never outlive the
+    // process it belongs to.
+    let mut reload_task: Option<tokio::task::JoinHandle<()>> = None;
+    if let Some(handle) = reload {
+        let mut rx = Some(handle.subscribe());
+        let shared = shared.clone();
+        let mut stop = shutdown.subscribe();
+        reload_task = Some(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = shutdown_signal(&mut stop) => return,
+                    () = reload_signal(&mut rx) => {}
+                }
+                let published = match rx.as_mut() {
+                    Some(rx) => rx.borrow_and_update().clone(),
+                    None => None,
+                };
+                match published {
+                    Some(next) => apply_reload(&shared, next),
+                    None => return,
+                }
+            }
+        }));
+    }
+
     let permits = Arc::new(Semaphore::new(limits.max_connections.max(1)));
     let ip_counters: IpCounters = Arc::new(Mutex::new(HashMap::new()));
     // Machine-word sized so 32-bit targets without 64-bit atomics still compile.
@@ -405,6 +558,11 @@ pub async fn serve(
         .await;
     }
 
+    if let Some(task) = reload_task {
+        task.abort();
+        let _ = task.await;
+    }
+
     Ok(summary)
 }
 
@@ -451,9 +609,18 @@ mod tests {
     }
 
     async fn start(config: Config, recorder: Recorder) -> Server {
+        start_full(config, recorder, None).await
+    }
+
+    /// Same, with a reload handle the test can publish into.
+    async fn start_full(
+        config: Config,
+        recorder: Recorder,
+        reload: Option<ReloadHandle>,
+    ) -> Server {
         let shutdown = ShutdownHandle::new();
         let (tx, rx) = oneshot::channel();
-        let task = tokio::spawn(serve(config, recorder, shutdown.clone(), Some(tx)));
+        let task = tokio::spawn(serve(config, recorder, shutdown.clone(), Some(tx), reload));
         let bound = tokio::time::timeout(CLIENT_WAIT, rx)
             .await
             .expect("the listener reports its addresses")
@@ -901,6 +1068,125 @@ mod tests {
 
         let summary = server.stop().await;
         assert_eq!(summary.accepted, 2, "the listener kept accepting");
+    }
+
+    /// A waiting AUTH is cancelled by SIGTERM/shutdown promptly, and the attempt
+    /// is still recorded — cancelling the wait must not delete the evidence.
+    #[tokio::test]
+    async fn shutdown_cancels_a_waiting_auth_and_keeps_the_record() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let recorder = Recorder::new(tx, Arc::new(crate::record::DropCounter::new(0)));
+        // The longest allowed delay: only cancellation can end this quickly.
+        let config = config_with(|cfg| {
+            cfg.timing.auth_min_delay_ms = 5_000;
+            cfg.timing.auth_max_delay_ms = 6_000;
+        });
+        let server = start(config, recorder).await;
+        let mut client = server.connect().await;
+        send(
+            &mut client,
+            b"*3\r\n$4\r\nAUTH\r\n$5\r\nadmin\r\n$2\r\npw\r\n",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let started = Instant::now();
+        server.shutdown.trigger();
+        assert!(
+            read_until_eof(&mut client).await.is_empty(),
+            "the cancelled connection gets no reply"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "shutdown waited out the AUTH delay: {:?}",
+            started.elapsed()
+        );
+
+        let records = drain_records(&mut rx, Duration::from_millis(500)).await;
+        let auth = records
+            .iter()
+            .find_map(|record| match record {
+                Record::Auth(auth) => Some(auth),
+                _ => None,
+            })
+            .expect("the cancelled attempt must still be recorded");
+        assert_eq!(auth.username.as_deref(), Some("admin"));
+        assert_eq!(auth.password_len, 2);
+        assert!(
+            (5_000..=6_000).contains(&auth.delay_ms),
+            "delay_ms is the planned delay, got {}",
+            auth.delay_ms
+        );
+        let meta = auth.meta.as_deref().unwrap_or_default().to_string();
+        assert!(meta.contains("outcome=server_shutdown"), "{meta}");
+        assert!(meta.contains("via=auth"), "{meta}");
+        let closed = records.iter().find_map(|record| match record {
+            Record::Closed(closed) => Some(closed.reason),
+            _ => None,
+        });
+        assert_eq!(closed, Some(CloseReason::ServerShutdown));
+
+        server.stop().await;
+    }
+
+    /// SIGHUP semantics, end to end: a published configuration reaches *new*
+    /// connections, and the shared keyspace is re-capped immediately.
+    #[tokio::test]
+    async fn reload_applies_to_new_connections_and_recaps_the_store() {
+        let reload = ReloadHandle::new();
+        let server = start_full(base_config(), Recorder::disabled(), Some(reload.clone())).await;
+
+        // Baseline: the 10-20 ms window from `base_config`.
+        let mut fast = server.connect().await;
+        let started = Instant::now();
+        send(&mut fast, b"*2\r\n$4\r\nAUTH\r\n$1\r\nx\r\n").await;
+        assert_eq!(read_one_line(&mut fast).await.as_slice(), b"+OK\r\n");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "the baseline window was not used: {:?}",
+            started.elapsed()
+        );
+
+        // Publish a much longer window and a tiny per-key store budget.
+        let mut next = base_config();
+        next.timing.auth_min_delay_ms = 300;
+        next.timing.auth_max_delay_ms = 320;
+        next.limits.store_max_bytes = 4_096;
+        next.limits.store_max_value_bytes = 64;
+        next.validate()
+            .expect("a reloadable configuration must be valid");
+        assert!(reload.apply(next), "the listener must receive the reload");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // A new connection uses the new window...
+        let mut slow = server.connect().await;
+        let started = Instant::now();
+        send(&mut slow, b"*2\r\n$4\r\nAUTH\r\n$1\r\nx\r\n").await;
+        assert_eq!(read_one_line(&mut slow).await.as_slice(), b"+OK\r\n");
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "the reloaded AUTH window was not applied: {:?}",
+            started.elapsed()
+        );
+
+        // ...and the keyspace was re-capped: 100 bytes no longer fit 64.
+        let mut capped = server.connect().await;
+        let value = vec![b'z'; 100];
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n");
+        frame.extend_from_slice(format!("${}\r\n", value.len()).as_bytes());
+        frame.extend_from_slice(&value);
+        frame.extend_from_slice(b"\r\n");
+        send(&mut capped, &frame).await;
+        let reply = read_one_line(&mut capped).await;
+        assert!(
+            reply.starts_with(b"-ERR"),
+            "the lowered store budget did not take effect: {reply:?}"
+        );
+
+        // A publish with no listener is reported, never fatal.
+        server.stop().await;
+        assert!(!reload.apply(base_config()), "the listener is gone");
     }
 
     #[test]

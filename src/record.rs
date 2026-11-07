@@ -153,10 +153,16 @@ pub struct AuthRecord {
     pub ip: IpAddr,
     pub at: SystemTime,
     pub username: Option<String>,
-    pub arg_count: u8,
+    /// Arguments of the command that carried the credentials (`AUTH`: 2 or 3,
+    /// `HELLO…AUTH`: the whole option list). `u16` because
+    /// [`crate::config::Limits::max_args`] allows up to 256 and `u8` would wrap.
+    pub arg_count: u16,
     pub password_len: usize,
     pub password: Option<String>,
     pub simulated_ok: bool,
+    /// Planned (simulated) delay in milliseconds; the measured wait and the
+    /// outcome are in `meta`, so an attempt cancelled by a disconnect is still
+    /// distinguishable from one that was actually delayed.
     pub delay_ms: u64,
     pub meta: Option<String>,
 }

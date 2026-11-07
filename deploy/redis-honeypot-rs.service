@@ -4,6 +4,13 @@ Documentation=file:/usr/share/doc/redis-honeypot-rs/README.md
 After=network-online.target
 Wants=network-online.target
 
+# Restart-loop guard: a unit that cannot start (missing database directory,
+# wrong permissions, a broken binary) must not be restarted forever. systemd
+# keeps it in `failed` after 5 starts within 60 s, which is visible in
+# `systemctl status` instead of silently burning CPU.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=redishoney
@@ -16,11 +23,27 @@ StateDirectoryMode=0700
 ExecStart=/usr/local/bin/redis-honeypot-rs serve \
     --bind 0.0.0.0:6379 \
     --db /var/lib/redis-honeypot/redis-honeypot.db
+
+# SIGHUP is a real, implemented reload (see `wait_for_reload_signal` in
+# src/main.rs): the file named by --config is re-read and re-validated, then the
+# reloadable subset (auth timing, per-connection limits and parser caps for NEW
+# connections, plus the shared keyspace budget, which is applied immediately) is
+# swapped in. An invalid file is logged and discarded — a reload can never take
+# the service down.
+# Fixed at startup, so still restart-only: the bind address, enable_ipv6,
+# max_connections / max_connections_per_ip, and every [database] knob. The
+# reload logs exactly which of those changed, if any — apply them with
+# `systemctl restart redis-honeypot-rs`.
 ExecReload=/bin/kill -HUP $MAINPID
+
 Restart=always
 RestartSec=2s
-TimeoutStopSec=20s
+# SIGTERM drains connections (up to ~15 s) and then flushes the SQLite queue
+# (up to ~5 s), so the stop budget has to be larger than the sum.
+TimeoutStopSec=30s
 KillSignal=SIGTERM
+# A second signal is never needed: the shutdown path is itself time bounded.
+SendSIGKILL=yes
 
 # --- filesystem sandbox ----------------------------------------------------
 # The honeypot must never read or write anything except its own database.
@@ -32,20 +55,36 @@ ProcSubset=pid
 ReadWritePaths=/var/lib/redis-honeypot
 PrivateTmp=yes
 PrivateDevices=yes
-PrivateUsers=yes
 ProtectClock=yes
 ProtectHostname=yes
 ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
-RestrictFileSystems=@basic-api
 UMask=0077
+
+# The database lives on an ordinary Linux filesystem, so the whitelist must
+# include the common block filesystems: @basic-api alone (tmpfs, proc, sysfs,
+# devtmpfs, …) does not cover ext4/xfs/btrfs and SQLite would fail to open its
+# file with EACCES. @common-block adds ext2/3/4, xfs, btrfs, f2fs, vfat and
+# friends. If the database is placed on a network or fuse filesystem, extend
+# this list (or drop the line) — otherwise the service cannot create the file.
+RestrictFileSystems=@basic-api @common-block
+
+# `PrivateUsers=yes` is intentionally NOT set. It requires an unprivileged user
+# namespace, which some hardened distributions disable
+# (`kernel.unprivileged_userns_clone=0`, or a container without CAP_SYS_ADMIN);
+# on such hosts the service would fail to start at all. The honeypot already runs
+# as an unprivileged user with an empty capability set inside
+# `ProtectSystem=strict`, so the namespace bought little and cost portability.
+# Enable it locally if your kernel allows user namespaces.
 
 # --- kernel / syscall sandbox ---------------------------------------------
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
+# Only the two families the honeypot actually uses: no AF_UNIX, no AF_NETLINK.
+# (Logging goes through the inherited stdout/stderr fds, not a socket.)
 RestrictAddressFamilies=AF_INET AF_INET6
 LockPersonality=yes
 MemoryDenyWriteExecute=yes

@@ -25,7 +25,7 @@ use crate::text;
 use crate::timeutil;
 
 use super::store::{DB_COUNT, SCAN_COUNT_DEFAULT, SCAN_COUNT_MAX, StoreError, VirtualStore};
-use super::{AuthAttempt, SessionState, render_config_pair, with_store};
+use super::{AuthAttempt, AuthMethod, SessionState, render_config_pair, with_store};
 
 /// Version this server claims to be. Only ever a static string.
 pub const REDIS_VERSION: &str = "7.2.4";
@@ -112,7 +112,7 @@ pub fn execute(
         "ECHO" => cmd_echo(p),
         "QUIT" => cmd_quit(p),
         "AUTH" => cmd_auth(p, session, limits, record_passwords),
-        "HELLO" => cmd_hello(p, session),
+        "HELLO" => cmd_hello(p, session, limits, record_passwords),
         "CLIENT" => cmd_client(p, session, limits),
         "SELECT" => cmd_select(p, session),
         // information gathering
@@ -187,6 +187,11 @@ fn store_error(err: StoreError) -> RespFrame {
         StoreError::ValueTooLarge { size, max } => RespFrame::Error(
             format!("ERR value is too large ({size} bytes, limit {max} bytes)").into_bytes(),
         ),
+        // A simulator specific limit, spelled out so the reply is honest instead
+        // of pretending to be a real server's OOM.
+        StoreError::TooManyElements { count, max } => RespFrame::Error(
+            format!("ERR too many elements ({count}, simulated limit {max})").into_bytes(),
+        ),
     }
 }
 
@@ -257,60 +262,147 @@ fn cmd_quit(p: &[Vec<u8>]) -> Reply {
     reply
 }
 
+/// Shared credential capture for `AUTH` and `HELLO … AUTH`.
+///
+/// One function, so both spellings produce exactly the same record: same
+/// unconditional success, same attempt counter, same masking rule. Only the
+/// `method` label and the argument count differ.
+fn record_auth(
+    session: &mut SessionState,
+    limits: &Limits,
+    record_passwords: bool,
+    method: AuthMethod,
+    username: Option<&[u8]>,
+    raw_password: &[u8],
+    arg_count: u16,
+) -> AuthAttempt {
+    // Bound the capture by the configured preview cap, not by a constant: the
+    // stored username and password are the same budget as any other preview.
+    let cap = limits.max_stored_param_bytes;
+    let username =
+        username.map(|user| String::from_utf8_lossy(&user[..user.len().min(cap)]).into_owned());
+    let password = if record_passwords {
+        Some(String::from_utf8_lossy(&raw_password[..raw_password.len().min(cap)]).into_owned())
+    } else {
+        None
+    };
+
+    // AUTH always succeeds, and it counts as an attempt whichever spelling sent it.
+    session.authenticated = true;
+    session.auth_attempts = session.auth_attempts.saturating_add(1);
+
+    AuthAttempt {
+        method,
+        username,
+        password_len: raw_password.len(),
+        password,
+        arg_count,
+    }
+}
+
 fn cmd_auth(
     p: &[Vec<u8>],
     session: &mut SessionState,
     limits: &Limits,
     record_passwords: bool,
 ) -> Reply {
-    let (username, raw_password, arg_count) = match p {
-        [password] => (None, password, 1_u8),
-        [user, password] => (Some(user), password, 2_u8),
+    let (username, raw_password, arg_count): (Option<&[u8]>, &[u8], u16) = match p {
+        [password] => (None, password.as_slice(), 2_u16),
+        [user, password] => (Some(user.as_slice()), password.as_slice(), 3_u16),
         _ => return Reply::arity("auth"),
     };
 
-    let username = username.map(|user| {
-        String::from_utf8_lossy(&user[..user.len().min(limits.max_stored_param_bytes)]).into_owned()
-    });
-    let password = if record_passwords {
-        Some(
-            String::from_utf8_lossy(
-                &raw_password[..raw_password.len().min(limits.max_stored_param_bytes)],
-            )
-            .into_owned(),
-        )
-    } else {
-        None
-    };
-
-    session.authenticated = true;
-    session.auth_attempts = session.auth_attempts.saturating_add(1);
-
+    let attempt = record_auth(
+        session,
+        limits,
+        record_passwords,
+        AuthMethod::Auth,
+        username,
+        raw_password,
+        arg_count,
+    );
     let mut reply = Reply::ok();
     reply.simulated = "auth";
-    reply.auth = Some(AuthAttempt {
-        username,
-        password_len: raw_password.len(),
-        password,
-        arg_count,
-    });
+    reply.auth = Some(attempt);
     reply
 }
 
-fn cmd_hello(p: &[Vec<u8>], session: &mut SessionState) -> Reply {
+/// `HELLO [protover [AUTH user pass] [SETNAME name]]`.
+///
+/// The `AUTH` option is *not* decorative: a scanner that only ever sends
+/// `HELLO 3 AUTH default pw` is a credential attempt, so it goes through the very
+/// same capture, delay and `auth_attempts` row as `AUTH` itself. The simulation
+/// still always succeeds.
+fn cmd_hello(
+    p: &[Vec<u8>],
+    session: &mut SessionState,
+    limits: &Limits,
+    record_passwords: bool,
+) -> Reply {
     let version = match p.first() {
         None => session.resp_version,
         Some(raw) => match parse_i64(raw) {
             Some(2) => 2,
             Some(3) => 3,
+            // Everything else — including a non-numeric version — is NOPROTO.
             _ => {
                 return Reply::error("NOPROTO unsupported protocol version", "rejected");
             }
         },
     };
-    // Trailing `AUTH`/`SETNAME` tokens are accepted and ignored: they must never
-    // turn into a credentials record, which belongs to `AUTH` alone.
+
+    // Parse the option list. Order is free, a repeated option takes its last
+    // value (like Redis), and anything unexpected is a syntax error.
+    let mut credentials: Option<(&[u8], &[u8])> = None;
+    let mut setname: Option<&[u8]> = None;
+    let mut index = 1_usize;
+    while let Some(option) = p.get(index) {
+        if option.eq_ignore_ascii_case(b"AUTH") {
+            let Some(username) = p.get(index + 1) else {
+                return Reply::error("ERR Syntax error in HELLO option 'AUTH'", "rejected");
+            };
+            let Some(password) = p.get(index + 2) else {
+                return Reply::error("ERR Syntax error in HELLO option 'AUTH'", "rejected");
+            };
+            credentials = Some((username.as_slice(), password.as_slice()));
+            index += 3;
+        } else if option.eq_ignore_ascii_case(b"SETNAME") {
+            let Some(name) = p.get(index + 1) else {
+                return Reply::error("ERR Syntax error in HELLO option 'SETNAME'", "rejected");
+            };
+            setname = Some(name.as_slice());
+            index += 2;
+        } else {
+            return Reply::error(
+                format!(
+                    "ERR Syntax error in HELLO option '{}'",
+                    text::escape_bytes(option, 32)
+                ),
+                "rejected",
+            );
+        }
+    }
+
     session.resp_version = version;
+    if let Some(name) = setname {
+        session.client_name = Some(name[..name.len().min(limits.max_stored_param_bytes)].to_vec());
+    }
+
+    // The credential capture happens after the version swap so the reply is
+    // encoded with the negotiated protocol either way.
+    let attempt = credentials.map(|(username, password)| {
+        record_auth(
+            session,
+            limits,
+            record_passwords,
+            AuthMethod::Hello,
+            Some(username),
+            password,
+            // Options exclude the command name, so add it back: `arg_count`
+            // means the same thing here as it does in `commands.arg_count`.
+            u16::try_from(p.len().saturating_add(1)).unwrap_or(u16::MAX),
+        )
+    });
 
     let pairs = hello_pairs(version, session.conn_id);
     let frame = if version >= 3 {
@@ -323,7 +415,9 @@ fn cmd_hello(p: &[Vec<u8>], session: &mut SessionState) -> Reply {
         }
         RespFrame::Array(flat)
     };
-    Reply::frame(frame, "hello")
+    let mut reply = Reply::frame(frame, "hello");
+    reply.auth = attempt;
+    reply
 }
 
 fn hello_pairs(version: u8, conn_id: u64) -> Vec<(RespFrame, RespFrame)> {

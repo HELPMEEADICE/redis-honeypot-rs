@@ -60,14 +60,14 @@ impl Harness {
         cfg.database.path = db_path.clone();
         cfg.validate().expect("test config must be valid");
 
-        let db = db::spawn_writer(&cfg.database).expect("database writer");
+        let db = db::spawn_writer(&cfg.database, &cfg.limits).expect("database writer");
         let recorder = db.recorder.clone();
         let shutdown = ShutdownHandle::new();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
         let server_shutdown = shutdown.clone();
         let task = tokio::spawn(async move {
-            server::serve(cfg, recorder, server_shutdown, Some(ready_tx)).await
+            server::serve(cfg, recorder, server_shutdown, Some(ready_tx), None).await
         });
 
         let bound = tokio::time::timeout(Duration::from_secs(10), ready_rx)
@@ -253,6 +253,18 @@ impl Conn {
         })
         .await
         .unwrap_or(None)
+    }
+
+    /// Hang up the hard way: `SO_LINGER 0` makes `close` send a TCP RST instead
+    /// of a FIN, which is the other half of what a scanner can do to us.
+    ///
+    /// `set_linger` is deprecated in tokio because `SO_LINGER` can block the
+    /// thread on drop — with a zero timeout it cannot, and there is no other
+    /// portable way to force a reset from a test.
+    #[allow(deprecated)]
+    pub fn abort(self) {
+        let _ = self.stream.set_linger(Some(Duration::ZERO));
+        drop(self.stream);
     }
 
     /// True when the peer has closed (EOF or reset) within the timeout.
