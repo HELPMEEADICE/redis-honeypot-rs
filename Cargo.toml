@@ -54,3 +54,9 @@ overflow-checks = false
 # Dependencies get the same size treatment; they are ~90% of the binary.
 [profile.release.package."*"]
 opt-level = "z"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = 0
